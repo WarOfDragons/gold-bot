@@ -10,16 +10,18 @@ let CHAT_ID = process.env.TELEGRAM_CHAT_ID ?? "-1002082257259";
 if (CHAT_ID === "-1001808291500") CHAT_ID = "-1002082257259";
 
 // ── config ────────────────────────────────────────────────────────────────────
+const ACCOUNT_BALANCE = 1000;          // balance for lot size calculation (info only)
+const RISK_PERCENT    = 1;             // % of balance to risk per trade (info only)
 const MIN_ATR        = 0.5;
 const MAX_ATR        = 25.0;
 const DEFAULT_ATR    = 5.0;
-const RR_MIN         = 1.5;            // real RR check (reward/risk)
-const SL_MULTIPLIER  = 1.2;            // SL = ATR * 1.2
+const RR_MIN         = 1.5;
+const SL_MULTIPLIER  = 1.2;
 const TP1_MULTIPLIER = 1.6;
 const TP2_MULTIPLIER = 2.5;
 const TP3_MULTIPLIER = 5.0;
-const MIN_SL_DIST    = 5.0;            // min SL in points
-const MAX_SL_DIST    = 18.0;           // soft cap
+const MIN_SL_DIST    = 5.0;
+const MAX_SL_DIST    = 18.0;
 const COOLDOWN_MS    = 10 * 60 * 1000;
 const SESSION_START  = 6;
 const SESSION_END    = 22;
@@ -173,7 +175,6 @@ async function getHTFTrend(ticker) {
   const closes = candles.map(c => parseFloat(c.close));
   const price  = closes[closes.length - 1];
 
-  // current EMA50 and previous EMA50 (one bar back) for slope
   const ema50Curr = calcEMA(closes, HTF_EMA_PERIOD);
   const ema50Prev = calcEMA(closes.slice(0, -1), HTF_EMA_PERIOD);
 
@@ -185,8 +186,6 @@ async function getHTFTrend(ticker) {
   const rising  = ema50Curr > ema50Prev;
   const falling = ema50Curr < ema50Prev;
 
-  // LONG only if price above EMA50 AND EMA50 is rising
-  // SHORT only if price below EMA50 AND EMA50 is falling
   let trend = "NEUTRAL";
   if (price > ema50Curr && rising)  trend = "LONG";
   if (price < ema50Curr && falling) trend = "SHORT";
@@ -196,7 +195,17 @@ async function getHTFTrend(ticker) {
     `cena=${r(price)}, trend=${trend}`
   );
 
-  return trend; // "LONG" | "SHORT" | "NEUTRAL"
+  return trend;
+}
+
+// ── position sizing (info only, no trade execution) ───────────────────────────
+function calcLotSize(entry, sl) {
+  const riskAmount = ACCOUNT_BALANCE * (RISK_PERCENT / 100);
+  const slDistance = Math.abs(entry - sl);
+  if (slDistance === 0) return { lotSize: 0, riskAmount, slDistance: 0 };
+  // XAUUSD: 1 lot = $100 per 1.0 point move
+  const lotSize = r(riskAmount / (slDistance * 100), 2);
+  return { lotSize, riskAmount, slDistance: r(slDistance) };
 }
 
 // ── levels builder ────────────────────────────────────────────────────────────
@@ -210,7 +219,6 @@ function buildLevels(signal, entry, atr) {
   const tp2 = r(entry + dir * slD * TP2_MULTIPLIER);
   const tp3 = r(entry + dir * slD * TP3_MULTIPLIER);
 
-  // real RR calculated from actual price levels (not assumed from multipliers)
   const risk    = Math.abs(entry - sl);
   const reward1 = Math.abs(tp1 - entry);
   const reward2 = Math.abs(tp2 - entry);
@@ -234,7 +242,8 @@ function canOpen(ticker, signal, entry, atr) {
   if (atr > MAX_ATR) return { ok: false, reason: `ATR za wysokie (${atr.toFixed(2)} > ${MAX_ATR})` };
 
   const active = activeTrades.get(ticker);
-  if (active?.status === "OPEN") return { ok: false, reason: `Aktywna pozycja ${active.signal} już otwarta na ${ticker}` };
+  if (active?.status === "OPEN")
+    return { ok: false, reason: `Aktywna pozycja ${active.signal} już otwarta na ${ticker}` };
 
   const lastAt = lastSignalAt.get(ticker);
   if (lastAt !== undefined) {
@@ -256,15 +265,12 @@ function canOpen(ticker, signal, entry, atr) {
   }
 
   const levels = buildLevels(signal, entry, atr);
-
-  // real RR: actual reward / actual risk from computed levels
   const risk   = Math.abs(entry - levels.sl);
   const reward = Math.abs(levels.tp1 - entry);
   const realRR = risk > 0 ? r(reward / risk) : 0;
 
-  if (realRR < RR_MIN) {
+  if (realRR < RR_MIN)
     return { ok: false, reason: `REJECT_RR_TOO_LOW (RR=${realRR} < min ${RR_MIN}, risk=${r(risk)}, reward=${r(reward)})` };
-  }
 
   return { ok: true, reason: "ACCEPT", levels };
 }
@@ -285,9 +291,9 @@ function registerTrade(ticker, signal, levels) {
 function closeTrade(ticker, closePrice, reason) {
   const trade = activeTrades.get(ticker);
   if (!trade) return;
-  trade.status = "CLOSED";
-  trade.closedAt = new Date().toUTCString();
-  trade.closePrice = r(closePrice);
+  trade.status      = "CLOSED";
+  trade.closedAt    = new Date().toUTCString();
+  trade.closePrice  = r(closePrice);
   trade.closeReason = reason;
 }
 
@@ -295,6 +301,7 @@ function closeTrade(ticker, closePrice, reason) {
 function formatEntry(ticker, signal, levels, atr, tf, strategy) {
   const emoji = signal === "LONG" ? "🟢" : "🔴";
   const dir   = signal === "LONG" ? "LONG  📈" : "SHORT 📉";
+  const { lotSize, riskAmount, slDistance } = calcLotSize(levels.entry, levels.sl);
   return (
     `${emoji} <b>${ticker} ${dir}</b>\n\n` +
     `💰 <b>Entry:</b> <code>${levels.entry}</code>\n` +
@@ -302,7 +309,11 @@ function formatEntry(ticker, signal, levels, atr, tf, strategy) {
     `🎯 <b>TP1:</b>  <code>${levels.tp1}</code>  <i>(+${levels.tp1Dist} pkt | RR ${levels.rr1})</i>\n` +
     `🎯🎯 <b>TP2:</b> <code>${levels.tp2}</code>  <i>(+${levels.tp2Dist} pkt | RR ${levels.rr2})</i>\n` +
     `🚀 <b>TP3:</b>  <code>${levels.tp3}</code>  <i>(+${levels.tp3Dist} pkt | RR ${levels.rr3})</i>\n\n` +
-    `📊 <b>ATR14:</b> ${atr.toFixed(2)}  |  <b>TF:</b> ${tf}\n` +
+    `📊 <b>ATR14:</b> ${atr.toFixed(2)}  |  <b>TF:</b> ${tf}\n\n` +
+    `💼 <b>Kalkulator pozycji</b> <i>(tylko info)</i>\n` +
+    `   Balans: $${ACCOUNT_BALANCE}  |  Ryzyko: ${RISK_PERCENT}% ($${r(riskAmount)})\n` +
+    `   SL dystans: ${slDistance} pkt\n` +
+    `   📐 <b>Lot size: <code>${lotSize}</code></b>\n\n` +
     `🤖 <i>${strategy}</i>\n` +
     `🕐 <i>${new Date().toUTCString()}</i>`
   );
@@ -372,10 +383,16 @@ function checkEntryQuality(candles, signal) {
     if (body < 0.01) continue;
     if (signal === "SHORT") {
       const lw = Math.min(o, cl) - lo;
-      if (lw / body > M1_MAX_WICK_TO_BODY_RATIO) { rejects.push(`REJECT_WICK_REJECTION (dolny knot ${lw.toFixed(2)} > ${M1_MAX_WICK_TO_BODY_RATIO}x korpus ${body.toFixed(2)})`); break; }
+      if (lw / body > M1_MAX_WICK_TO_BODY_RATIO) {
+        rejects.push(`REJECT_WICK_REJECTION (dolny knot ${lw.toFixed(2)} > ${M1_MAX_WICK_TO_BODY_RATIO}x korpus ${body.toFixed(2)})`);
+        break;
+      }
     } else {
       const uw = h - Math.max(o, cl);
-      if (uw / body > M1_MAX_WICK_TO_BODY_RATIO) { rejects.push(`REJECT_WICK_REJECTION (górny knot ${uw.toFixed(2)} > ${M1_MAX_WICK_TO_BODY_RATIO}x korpus ${body.toFixed(2)})`); break; }
+      if (uw / body > M1_MAX_WICK_TO_BODY_RATIO) {
+        rejects.push(`REJECT_WICK_REJECTION (górny knot ${uw.toFixed(2)} > ${M1_MAX_WICK_TO_BODY_RATIO}x korpus ${body.toFixed(2)})`);
+        break;
+      }
     }
   }
 
@@ -387,7 +404,8 @@ function checkEntryQuality(candles, signal) {
     const total   = Math.max(pH, cH) - Math.min(pL, cL);
     if (total > 0 && overlap / total > M1_CHOP_OVERLAP_THRESHOLD) choppyPairs++;
   }
-  if (choppyPairs >= 3) rejects.push(`REJECT_CHOP (${choppyPairs}/4 par świec nakłada się > ${M1_CHOP_OVERLAP_THRESHOLD * 100}%)`);
+  if (choppyPairs >= 3)
+    rejects.push(`REJECT_CHOP (${choppyPairs}/4 par świec nakłada się > ${M1_CHOP_OVERLAP_THRESHOLD * 100}%)`);
 
   let pressureBars = 0;
   for (let i = last5.length - 1; i >= 0; i--) {
@@ -402,7 +420,8 @@ function checkEntryQuality(candles, signal) {
 
   return {
     pass: rejects.length === 0, rejects,
-    debug: { ema20: r(ema20), atr14: r(atr14), emaDist: `${emaDist.toFixed(3)}%`, moveDist: r(moveDist), avgBody: r(avgBody), choppyPairs, pressureBars, currentPrice: r(currentPrice) },
+    debug: { ema20: r(ema20), atr14: r(atr14), emaDist: `${emaDist.toFixed(3)}%`,
+             moveDist: r(moveDist), avgBody: r(avgBody), choppyPairs, pressureBars, currentPrice: r(currentPrice) },
   };
 }
 
@@ -417,19 +436,36 @@ async function checkTrades() {
     const tp1Hit = isLong ? price >= trade.tp1 : price <= trade.tp1;
     if (tp1Hit && !trade.tp1Hit) {
       trade.tp1Hit = true; trade.sl = trade.entry;
-      await sendTelegram(`🎯 <b>TP1 HIT — ${ticker}</b>\nEntry: <code>${trade.entry}</code> → TP1: <code>${r(trade.tp1)}</code>  |  Cena: <code>${r(price)}</code>\n\n🔒 <b>SL przesunięty na entry (breakeven): <code>${trade.entry}</code></b>\n🎯🎯 Cel TP2: <code>${r(trade.tp2)}</code>\n<i>${new Date().toUTCString()}</i>`);
+      await sendTelegram(
+        `🎯 <b>TP1 HIT — ${ticker}</b>\n` +
+        `Entry: <code>${trade.entry}</code> → TP1: <code>${r(trade.tp1)}</code>  |  Cena: <code>${r(price)}</code>\n\n` +
+        `🔒 <b>SL przesunięty na entry (breakeven): <code>${trade.entry}</code></b>\n` +
+        `🎯🎯 Cel TP2: <code>${r(trade.tp2)}</code>\n` +
+        `<i>${new Date().toUTCString()}</i>`
+      );
     }
 
     const tp2Hit = isLong ? price >= trade.tp2 : price <= trade.tp2;
     if (tp2Hit && !trade.tp2Hit) {
       trade.tp1Hit = true; trade.tp2Hit = true; trade.sl = trade.tp1;
-      await sendTelegram(`🎯🎯 <b>TP2 HIT — ${ticker}</b>\nEntry: <code>${trade.entry}</code> → TP2: <code>${r(trade.tp2)}</code>  |  Cena: <code>${r(price)}</code>\n\n🔒 <b>SL przesunięty na TP1 (profit locked): <code>${r(trade.tp1)}</code></b>\n🚀 Cel TP3: <code>${r(trade.tp3)}</code>\n<i>${new Date().toUTCString()}</i>`);
+      await sendTelegram(
+        `🎯🎯 <b>TP2 HIT — ${ticker}</b>\n` +
+        `Entry: <code>${trade.entry}</code> → TP2: <code>${r(trade.tp2)}</code>  |  Cena: <code>${r(price)}</code>\n\n` +
+        `🔒 <b>SL przesunięty na TP1 (profit locked): <code>${r(trade.tp1)}</code></b>\n` +
+        `🚀 Cel TP3: <code>${r(trade.tp3)}</code>\n` +
+        `<i>${new Date().toUTCString()}</i>`
+      );
     }
 
     const tp3Hit = isLong ? price >= trade.tp3 : price <= trade.tp3;
     if (tp3Hit) {
       closeTrade(ticker, price, "TP3"); lastSignalAt.set(ticker, Date.now());
-      await sendTelegram(`🚀 <b>TP3 HIT — PEŁNE ZAMKNIĘCIE — ${ticker}</b>\nPozycja: ${trade.signal} @ <code>${trade.entry}</code>\nTP3: <code>${r(trade.tp3)}</code>  |  Cena: <code>${r(price)}</code>\nOtwarto: ${trade.openedAt}\nZamknięto: ${new Date().toUTCString()}`);
+      await sendTelegram(
+        `🚀 <b>TP3 HIT — PEŁNE ZAMKNIĘCIE — ${ticker}</b>\n` +
+        `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
+        `TP3: <code>${r(trade.tp3)}</code>  |  Cena: <code>${r(price)}</code>\n` +
+        `Otwarto: ${trade.openedAt}\nZamknięto: ${new Date().toUTCString()}`
+      );
       continue;
     }
 
@@ -437,7 +473,12 @@ async function checkTrades() {
     if (slHit) {
       const slLabel = trade.tp2Hit ? "poziom TP1 (profit chroniony)" : trade.tp1Hit ? "entry (breakeven)" : "oryginalny SL";
       closeTrade(ticker, price, "SL"); lastSignalAt.set(ticker, Date.now());
-      await sendTelegram(`🛑 <b>SL HIT — ${ticker}</b>\nPozycja: ${trade.signal} @ <code>${trade.entry}</code>\nSL (<i>${slLabel}</i>): <code>${r(trade.sl)}</code>  |  Cena: <code>${r(price)}</code>\nOtwarto: ${trade.openedAt}\nZamknięto: ${new Date().toUTCString()}`);
+      await sendTelegram(
+        `🛑 <b>SL HIT — ${ticker}</b>\n` +
+        `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
+        `SL (<i>${slLabel}</i>): <code>${r(trade.sl)}</code>  |  Cena: <code>${r(price)}</code>\n` +
+        `Otwarto: ${trade.openedAt}\nZamknięto: ${new Date().toUTCString()}`
+      );
     }
   }
 }
@@ -504,7 +545,11 @@ app.get("/test-signal", async (_req, res) => {
     const atr     = candles ? (calcATR(candles) ?? DEFAULT_ATR) : DEFAULT_ATR;
     const entry   = price ?? 4800;
     const levels  = buildLevels("LONG", entry, atr);
-    const tgResult = await sendTelegram(`🧪 <b>TEST SYGNAŁU — XAUUSD LONG</b>\n\n` + formatEntry("XAUUSD", "LONG", levels, atr, "1m", "TEST") + `\n\n<i>⚠️ To jest sygnał testowy, nie wchodzić w pozycję!</i>`);
+    const tgResult = await sendTelegram(
+      `🧪 <b>TEST SYGNAŁU — XAUUSD LONG</b>\n\n` +
+      formatEntry("XAUUSD", "LONG", levels, atr, "1m", "TEST") +
+      `\n\n<i>⚠️ To jest sygnał testowy, nie wchodzić w pozycję!</i>`
+    );
     res.json({ ok: true, telegram: tgResult, entry, atr: r(atr), levels, note: "Test signal sent. Quality filters bypassed." });
   } catch (err) { res.json({ ok: false, error: String(err) }); }
 });
@@ -513,12 +558,19 @@ app.get("/admin/close", async (req, res) => {
   const ticker = String(req.query.ticker ?? "XAUUSD").toUpperCase();
   const reason = String(req.query.reason ?? "MANUAL");
   const trade  = activeTrades.get(ticker);
-  if (!trade || trade.status !== "OPEN") return res.json({ ok: false, reason: `Brak otwartego trade dla ${ticker}` });
+  if (!trade || trade.status !== "OPEN")
+    return res.json({ ok: false, reason: `Brak otwartego trade dla ${ticker}` });
   const price = await fetchPrice(ticker) ?? trade.entry;
   closeTrade(ticker, price, reason);
   lastSignalAt.set(ticker, Date.now());
   const pnl = trade.signal === "LONG" ? r(price - trade.entry) : r(trade.entry - price);
-  await sendTelegram(`🔧 <b>RĘCZNE ZAMKNIĘCIE — ${ticker}</b>\nPozycja: ${trade.signal} @ <code>${trade.entry}</code>\nZamknięto @ <code>${r(price)}</code>  (<i>${reason}</i>)\nP&L: <code>${pnl > 0 ? "+" : ""}${pnl} pkt</code>\n<i>${new Date().toUTCString()}</i>`);
+  await sendTelegram(
+    `🔧 <b>RĘCZNE ZAMKNIĘCIE — ${ticker}</b>\n` +
+    `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
+    `Zamknięto @ <code>${r(price)}</code>  (<i>${reason}</i>)\n` +
+    `P&L: <code>${pnl > 0 ? "+" : ""}${pnl} pkt</code>\n` +
+    `<i>${new Date().toUTCString()}</i>`
+  );
   console.log(`[ADMIN] Ręcznie zamknięto ${ticker} @ ${r(price)} (${reason})`);
   return res.json({ ok: true, ticker, closePrice: r(price), pnl, reason });
 });
