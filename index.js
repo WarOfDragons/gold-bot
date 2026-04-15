@@ -469,17 +469,6 @@ function checkEntryQuality(candles, signal) {
   if (pressureBars >= M1_MAX_PRESSURE_BARS)
     rejects.push(`REJECT_NO_FRESH_IMPULSE (${pressureBars} świec z rzędu >= max ${M1_MAX_PRESSURE_BARS} = overextended)`);
 
-  // 9. Momentum — rosnące korpusy w kierunku sygnału (min 2/3)
-  let momentumScore = 0;
-  for (let i = last5.length - 3; i < last5.length; i++) {
-    const body     = Math.abs(parseFloat(last5[i].close)     - parseFloat(last5[i].open));
-    const prevBody = Math.abs(parseFloat(last5[i - 1].close) - parseFloat(last5[i - 1].open));
-    if (signal === "LONG"  && parseFloat(last5[i].close) > parseFloat(last5[i].open) && body > prevBody * 1.078) momentumScore++;
-    if (signal === "SHORT" && parseFloat(last5[i].close) < parseFloat(last5[i].open) && body > prevBody * 1.078) momentumScore++;
-  }
-  if (momentumScore < 2)
-    rejects.push(`REJECT_WEAK_MOMENTUM (tylko ${momentumScore}/3 mocnych korpusów)`);
-
   return {
     pass: rejects.length === 0,
     rejects,
@@ -487,7 +476,7 @@ function checkEntryQuality(candles, signal) {
       ema20: r(ema20), atr14: r(atr14),
       emaDistAtr: `${emaDistAtr.toFixed(2)}x`,
       moveDist: r(moveDist), avgBody: r(avgBody),
-      choppyPairs, pressureBars, momentumScore, currentPrice: r(currentPrice),
+      choppyPairs, pressureBars, currentPrice: r(currentPrice),
     },
   };
 }
