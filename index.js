@@ -31,12 +31,12 @@ const FRIDAY_END     = 20;
 
 // ── entry quality config ──────────────────────────────────────────────────────
 const M1_EMA_PERIOD              = 20;
-const M1_EMA_MAX_DISTANCE_MULT   = 1.0;
-const M1_LATE_ENTRY_ATR_MULT     = 1.8;
+const M1_EMA_MAX_DISTANCE_MULT   = 1.02;
+const M1_LATE_ENTRY_ATR_MULT     = 1.84;
 const M1_MAX_PRESSURE_BARS       = 4;
-const M1_MIN_BODY_TO_ATR_RATIO   = 0.09;
+const M1_MIN_BODY_TO_ATR_RATIO   = 0.088;
 const M1_MAX_WICK_TO_BODY_RATIO  = 4.0;
-const M1_CHOP_OVERLAP_THRESHOLD  = 0.85;
+const M1_CHOP_OVERLAP_THRESHOLD  = 0.867;
 const M1_CANDLES_NEEDED          = 25;
 
 // HTF config
@@ -474,8 +474,8 @@ function checkEntryQuality(candles, signal) {
   for (let i = last5.length - 3; i < last5.length; i++) {
     const body     = Math.abs(parseFloat(last5[i].close)     - parseFloat(last5[i].open));
     const prevBody = Math.abs(parseFloat(last5[i - 1].close) - parseFloat(last5[i - 1].open));
-    if (signal === "LONG"  && parseFloat(last5[i].close) > parseFloat(last5[i].open) && body > prevBody * 1.1) momentumScore++;
-    if (signal === "SHORT" && parseFloat(last5[i].close) < parseFloat(last5[i].open) && body > prevBody * 1.1) momentumScore++;
+    if (signal === "LONG"  && parseFloat(last5[i].close) > parseFloat(last5[i].open) && body > prevBody * 1.078) momentumScore++;
+    if (signal === "SHORT" && parseFloat(last5[i].close) < parseFloat(last5[i].open) && body > prevBody * 1.078) momentumScore++;
   }
   if (momentumScore < 2)
     rejects.push(`REJECT_WEAK_MOMENTUM (tylko ${momentumScore}/3 mocnych korpusów)`);
