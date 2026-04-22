@@ -624,18 +624,18 @@ async function checkTrades() {
 
 function startPriceMonitor() {
   if (!TWELVEDATA_KEY) { console.warn("[MONITOR] TWELVEDATA_API_KEY nie ustawiony — wyłączony"); return; }
-  console.log("[MONITOR] Price monitor uruchomiony (30s open trade / 5min idle)");
+  console.log("[MONITOR] Price monitor uruchomiony (2min open trade / 10min idle)");
   let lastIdleCheck = 0;
   setInterval(async () => {
     const hasOpen = [...activeTrades.values()].some(t => t.status === "OPEN");
     const now = Date.now();
     if (hasOpen) {
       await checkTrades().catch(console.error);
-    } else if (now - lastIdleCheck > 5 * 60 * 1000) {
+    } else if (now - lastIdleCheck > 10 * 60 * 1000) {
       lastIdleCheck = now;
       await checkTrades().catch(console.error);
     }
-  }, 30_000);
+  }, 2 * 60_000);
 }
 
 // ── autonomous scan ───────────────────────────────────────────────────────────
@@ -712,6 +712,12 @@ function startSignalScanner() {
 
     if (scannerState.isScanning) {
       console.log("[SCAN] previous scan still running — skip");
+      return;
+    }
+
+    const activeNow = activeTrades.get("XAUUSD");
+    if (activeNow?.status === "OPEN") {
+      console.log(`[SCAN] Trade #${activeNow.id} otwarty — pomijam polling świec (oszczędzam API)`);
       return;
     }
 
