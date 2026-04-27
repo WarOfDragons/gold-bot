@@ -29,27 +29,32 @@ const SESSION_START  = 6;
 const SESSION_END    = 22;
 const FRIDAY_END     = 20;
 
+// ── H1 bias config ────────────────────────────────────────────────────────────
 const H1_FAST_EMA        = 20;
 const H1_SLOW_EMA        = 50;
 const H1_CANDLES_NEEDED  = 120;
 
+// ── M15 confirmation config ───────────────────────────────────────────────────
 const M15_FAST_EMA       = 20;
 const M15_SLOW_EMA       = 50;
 const M15_CANDLES_NEEDED = 80;
 
-const M5_FAST_EMA                        = 20;
-const M5_SLOW_EMA                        = 50;
-const M5_CANDLES_NEEDED                  = 60;
-const M5_RECLAIM_LOOKBACK                = 5;
-const M5_RECLAIM_MAX_EMA_DISTANCE_ATR    = 0.35;
-const M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR = 1.2;
-const M5_LAST_CANDLE_MIN_BODY_TO_ATR     = 0.18;
-const M5_CHOP_OVERLAP_THRESHOLD          = 0.80;
-const M5_MAX_PRESSURE_BARS               = 4;
+// ── M5 setup config ───────────────────────────────────────────────────────────
+const M5_FAST_EMA                       = 20;
+const M5_SLOW_EMA                       = 50;
+const M5_CANDLES_NEEDED                 = 60;
+const M5_RECLAIM_LOOKBACK               = 5;
+const M5_RECLAIM_MAX_EMA_DISTANCE_ATR   = 0.35;
+const M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR = 1.8;   // było 1.2
+const M5_LAST_CANDLE_MIN_BODY_TO_ATR    = 0.12;   // było 0.18
+const M5_CHOP_OVERLAP_THRESHOLD         = 0.80;
+const M5_MAX_PRESSURE_BARS              = 4;
 
+// News window (minuty :25–:35 każdej godziny)
 const NEWS_WINDOW_START = 25;
 const NEWS_WINDOW_END   = 35;
-const WEBHOOK_DEDUP_MS  = 10_000;
+
+const WEBHOOK_DEDUP_MS = 10_000;
 
 // ── state ─────────────────────────────────────────────────────────────────────
 const activeTrades  = new Map();
@@ -244,7 +249,7 @@ async function confirmM15Direction(ticker, bias) {
     return { pass: false, reason, debug: {} };
   }
 
-  const debug   = { price: r(price), ema20: r(ema20), ema50: r(ema50) };
+  const debug = { price: r(price), ema20: r(ema20), ema50: r(ema50) };
   const rejects = [];
 
   if (bias === "LONG") {
@@ -275,12 +280,14 @@ async function checkM5Setup(ticker, bias) {
   }
 
   const closes = candles.map(c => parseFloat(c.close));
+  const highs  = candles.map(c => parseFloat(c.high));
+  const lows   = candles.map(c => parseFloat(c.low));
   const last5  = candles.slice(-5);
 
-  const price = closes[closes.length - 1];
-  const ema20 = calcEMA(closes, M5_FAST_EMA);
-  const ema50 = calcEMA(closes, M5_SLOW_EMA);
-  const atr   = calcATR(candles);
+  const price  = closes[closes.length - 1];
+  const ema20  = calcEMA(closes, M5_FAST_EMA);
+  const ema50  = calcEMA(closes, M5_SLOW_EMA);
+  const atr    = calcATR(candles);
 
   if (!ema20 || !ema50 || !atr) {
     const reason = "REJECT_M5_INDICATOR_ERROR";
@@ -288,7 +295,7 @@ async function checkM5Setup(ticker, bias) {
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
 
-  const rejects    = [];
+  const rejects = [];
   const lastCandle = candles[candles.length - 1];
   const lastClose  = parseFloat(lastCandle.close);
   const lastOpen   = parseFloat(lastCandle.open);
@@ -296,32 +303,34 @@ async function checkM5Setup(ticker, bias) {
 
   const lookbackCandles = candles.slice(-(M5_RECLAIM_LOOKBACK + 1), -1);
 
-  // 1. EMA alignment
+  // ── 1. EMA alignment ──────────────────────────────────────────────────────
   if (bias === "LONG") {
     if (!(ema20 > ema50)) rejects.push("M5_EMA20_BELOW_EMA50");
   } else {
     if (!(ema20 < ema50)) rejects.push("M5_EMA20_ABOVE_EMA50");
   }
 
-  // 2. Reclaim
+  // ── 2. Reclaim ────────────────────────────────────────────────────────────
   const maxReclaimDist = M5_RECLAIM_MAX_EMA_DISTANCE_ATR * atr;
   let reclaimFound = false;
 
   if (bias === "LONG") {
     for (const c of lookbackCandles) {
-      if (Math.abs(parseFloat(c.low) - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
+      const low = parseFloat(c.low);
+      if (Math.abs(low - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
     }
     if (!reclaimFound)
       rejects.push(`M5_NO_RECLAIM_LONG (żaden low w ostatnich ${M5_RECLAIM_LOOKBACK} świecach nie był blisko EMA20 ±${r(maxReclaimDist)} pkt)`);
   } else {
     for (const c of lookbackCandles) {
-      if (Math.abs(parseFloat(c.high) - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
+      const high = parseFloat(c.high);
+      if (Math.abs(high - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
     }
     if (!reclaimFound)
       rejects.push(`M5_NO_RECLAIM_SHORT (żaden high w ostatnich ${M5_RECLAIM_LOOKBACK} świecach nie był blisko EMA20 ±${r(maxReclaimDist)} pkt)`);
   }
 
-  // 3. Ostatnia świeca po właściwej stronie EMA20
+  // ── 3. Ostatnia świeca ────────────────────────────────────────────────────
   if (bias === "LONG") {
     if (!(lastClose > ema20)) rejects.push(`M5_LAST_CLOSE_BELOW_EMA20 (close=${r(lastClose)} ema20=${r(ema20)})`);
     if (!(lastClose > lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BULLISH");
@@ -330,16 +339,16 @@ async function checkM5Setup(ticker, bias) {
     if (!(lastClose < lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BEARISH");
   }
 
-  // 4. Body ostatniej świecy
+  // ── 4. Body ───────────────────────────────────────────────────────────────
   if (lastBody < M5_LAST_CANDLE_MIN_BODY_TO_ATR * atr)
     rejects.push(`M5_LAST_CANDLE_WEAK_BODY (body=${r(lastBody)} < ${M5_LAST_CANDLE_MIN_BODY_TO_ATR}x ATR=${r(atr)})`);
 
-  // 5. Dystans od EMA20
+  // ── 5. Dystans od EMA20 ───────────────────────────────────────────────────
   const emaDistAtr = Math.abs(lastClose - ema20) / atr;
   if (emaDistAtr > M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR)
     rejects.push(`M5_TOO_FAR_FROM_EMA (${emaDistAtr.toFixed(2)}x ATR > max ${M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR}x ATR)`);
 
-  // 6. Chop filter
+  // ── 6. Chop filter ────────────────────────────────────────────────────────
   let choppyPairs = 0;
   for (let i = 1; i < last5.length; i++) {
     const pH = parseFloat(last5[i-1].high), pL = parseFloat(last5[i-1].low);
@@ -351,7 +360,7 @@ async function checkM5Setup(ticker, bias) {
   if (choppyPairs >= 3)
     rejects.push(`M5_CHOP (${choppyPairs}/4 par nakłada się > ${M5_CHOP_OVERLAP_THRESHOLD * 100}%)`);
 
-  // 7. Overextension
+  // ── 7. Overextension ──────────────────────────────────────────────────────
   let pressureBars = 0;
   for (let i = last5.length - 1; i >= 0; i--) {
     const isBull = parseFloat(last5[i].close) > parseFloat(last5[i].open);
@@ -380,7 +389,7 @@ async function checkM5Setup(ticker, bias) {
   return { pass: true, reason: "M5_OK", atr: r(atr), entry: r(lastClose), debug };
 }
 
-// ── position sizing (info only) ───────────────────────────────────────────────
+// ── position sizing ───────────────────────────────────────────────────────────
 function calcLotSize(entry, sl) {
   const riskAmount = ACCOUNT_BALANCE * (RISK_PERCENT / 100);
   const slDistance = Math.abs(entry - sl);
@@ -395,17 +404,14 @@ function buildLevels(signal, entry, atr) {
   const rawSlD = atr * SL_MULTIPLIER;
   const slD    = Math.min(Math.max(rawSlD, MIN_SL_DIST), MAX_SL_DIST);
   const dir    = signal === "LONG" ? 1 : -1;
-
   const sl  = r(entry - dir * slD);
   const tp1 = r(entry + dir * slD * TP1_MULTIPLIER);
   const tp2 = r(entry + dir * slD * TP2_MULTIPLIER);
   const tp3 = r(entry + dir * slD * TP3_MULTIPLIER);
-
   const risk    = Math.abs(entry - sl);
   const reward1 = Math.abs(tp1 - entry);
   const reward2 = Math.abs(tp2 - entry);
   const reward3 = Math.abs(tp3 - entry);
-
   return {
     entry, sl, tp1, tp2, tp3,
     rr1: r(risk > 0 ? reward1 / risk : 0),
@@ -422,11 +428,9 @@ function buildLevels(signal, entry, atr) {
 function canOpen(ticker, signal, entry, atr) {
   if (atr < MIN_ATR) return { ok: false, reason: `ATR za niskie (${atr.toFixed(2)} < ${MIN_ATR})` };
   if (atr > MAX_ATR) return { ok: false, reason: `ATR za wysokie (${atr.toFixed(2)} > ${MAX_ATR})` };
-
   const active = activeTrades.get(ticker);
   if (active?.status === "OPEN")
     return { ok: false, reason: `Aktywna pozycja ${active.signal} już otwarta na ${ticker}` };
-
   const lastAt = lastSignalAt.get(ticker);
   if (lastAt !== undefined) {
     const elapsed = Date.now() - lastAt;
@@ -435,29 +439,23 @@ function canOpen(ticker, signal, entry, atr) {
       return { ok: false, reason: `Cooldown — jeszcze ${rem} min` };
     }
   }
-
   if (!isInSession()) {
     const { weekday, hour, minute } = getWarsawNowParts();
     return {
       ok: false,
-      reason: `Poza sesją (teraz ${weekday} ${hour}:${String(minute).padStart(2,"0")} Warszawa | ` +
-               `sesja Pn–Czw 06:00–22:00, Pt 06:00–${FRIDAY_END}:00)`,
+      reason: `Poza sesją (teraz ${weekday} ${hour}:${String(minute).padStart(2,"0")} Warszawa | sesja Pn–Czw 06:00–22:00, Pt 06:00–${FRIDAY_END}:00)`,
     };
   }
-
   if (isNewsTime()) {
     const { minute } = getWarsawNowParts();
     return { ok: false, reason: `REJECT_NEWS_TIME_WINDOW (minuta ${minute}, okno :${NEWS_WINDOW_START}–:${NEWS_WINDOW_END})` };
   }
-
   const levels = buildLevels(signal, entry, atr);
   const risk   = Math.abs(entry - levels.sl);
   const reward = Math.abs(levels.tp1 - entry);
   const realRR = risk > 0 ? r(reward / risk) : 0;
-
   if (realRR < RR_MIN)
     return { ok: false, reason: `REJECT_RR_TOO_LOW (RR=${realRR} < min ${RR_MIN}, risk=${r(risk)}, reward=${r(reward)})` };
-
   return { ok: true, reason: "ACCEPT", levels };
 }
 
@@ -467,23 +465,12 @@ let tradeIdCounter = 0;
 function registerTrade(ticker, signal, levels) {
   tradeIdCounter++;
   activeTrades.set(ticker, {
-    id:          tradeIdCounter,
-    ticker,
-    signal,
-    entry:       levels.entry,
-    sl:          levels.sl,
-    slOriginal:  levels.sl,
-    tp1:         levels.tp1,
-    tp2:         levels.tp2,
-    tp3:         levels.tp3,
-    status:      "OPEN",
-    openedAt:    new Date().toUTCString(),
-    tp1Hit:      false,
-    tp2Hit:      false,
-    closedAt:    null,
-    closePrice:  null,
-    closeReason: null,
-    pnlPts:      null,
+    id: tradeIdCounter, ticker, signal,
+    entry: levels.entry, sl: levels.sl, slOriginal: levels.sl,
+    tp1: levels.tp1, tp2: levels.tp2, tp3: levels.tp3,
+    status: "OPEN", openedAt: new Date().toUTCString(),
+    tp1Hit: false, tp2Hit: false,
+    closedAt: null, closePrice: null, closeReason: null, pnlPts: null,
   });
   lastSignalAt.set(ticker, Date.now());
   tradeStats.total++;
@@ -546,17 +533,14 @@ async function sendTelegram(text) {
   }
 }
 
-// ── price monitor (TP/SL tracking) ───────────────────────────────────────────
+// ── price monitor ─────────────────────────────────────────────────────────────
 async function checkTrades() {
   for (const [ticker, trade] of activeTrades.entries()) {
     if (trade.status !== "OPEN") continue;
-
     const price = await fetchPrice(ticker);
     if (price === null) continue;
-
     const isLong = trade.signal === "LONG";
 
-    // TP1
     if (!trade.tp1Hit && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
       trade.tp1Hit = true;
       trade.sl     = trade.entry;
@@ -571,7 +555,6 @@ async function checkTrades() {
       );
     }
 
-    // TP2
     if (!trade.tp2Hit && (isLong ? price >= trade.tp2 : price <= trade.tp2)) {
       trade.tp1Hit = true;
       trade.tp2Hit = true;
@@ -587,7 +570,6 @@ async function checkTrades() {
       );
     }
 
-    // TP3
     if (isLong ? price >= trade.tp3 : price <= trade.tp3) {
       const pnl3 = r(Math.abs(trade.tp3 - trade.entry));
       closeTrade(ticker, price, "TP3");
@@ -602,7 +584,6 @@ async function checkTrades() {
       continue;
     }
 
-    // SL
     if (isLong ? price <= trade.sl : price >= trade.sl) {
       const slLabel            = trade.tp2Hit ? "TP1 (profit chroniony)" : trade.tp1Hit ? "entry (breakeven)" : "oryginalny SL";
       const executedClosePrice = trade.sl;
@@ -641,7 +622,6 @@ function startPriceMonitor() {
 // ── autonomous scan ───────────────────────────────────────────────────────────
 async function scanXAUUSD() {
   const ticker = "XAUUSD";
-
   const active = activeTrades.get(ticker);
   if (active?.status === "OPEN") {
     console.log(`[SCAN] Aktywny trade #${active.id} ${active.signal} @ ${active.entry} — pomijam scan`);
@@ -697,7 +677,7 @@ async function scanXAUUSD() {
   console.log(`[ENTRY] #${activeTrades.get(ticker).id} ${signal} ${ticker} @ ${entry} ATR=${r(atr)} H1=${h1.bias} [AUTONOMOUS]`);
 }
 
-// ── signal scanner (co zamknięcie świecy M5) ──────────────────────────────────
+// ── signal scanner ────────────────────────────────────────────────────────────
 function startSignalScanner() {
   if (!TWELVEDATA_KEY) {
     console.warn("[SCAN] TWELVEDATA_API_KEY nie ustawiony — scanner wyłączony");
@@ -757,7 +737,7 @@ function startSignalScanner() {
 function tryParseJson(v) { try { return JSON.parse(v); } catch { return {}; } }
 
 function parseWebhookPayload(body) {
-  const raw      = typeof body === "string" ? tryParseJson(body) : body ?? {};
+  const raw = typeof body === "string" ? tryParseJson(body) : body ?? {};
   const signal   = normalizeSignal(raw.signal ?? raw.side ?? raw.action ?? raw.order_action ?? raw.direction);
   const ticker   = normalizeTicker(raw.ticker ?? raw.symbol ?? raw.instrument ?? raw.market ?? "XAUUSD");
   const entry    = n(raw.entry ?? raw.price ?? raw.close ?? raw.last ?? raw.trigger_price, null);
@@ -771,8 +751,7 @@ function parseWebhookPayload(body) {
 app.get("/", (_req, res) => res.send("🤖 Gold Signal Bot running ✅"));
 
 app.get("/health", (_req, res) => res.status(200).json({
-  ok:           true,
-  status:       "ok",
+  ok: true, status: "ok",
   uptimeSec:    Math.floor(process.uptime()),
   activeTrades: [...activeTrades.values()].filter(t => t.status === "OPEN").length,
   time:         new Date().toISOString(),
@@ -850,7 +829,7 @@ app.get("/admin/close", async (req, res) => {
   const trade  = activeTrades.get(ticker);
   if (!trade || trade.status !== "OPEN")
     return res.json({ ok: false, reason: `Brak otwartego trade dla ${ticker}` });
-  const price  = await fetchPrice(ticker) ?? trade.entry;
+  const price = await fetchPrice(ticker) ?? trade.entry;
   closeTrade(ticker, price, reason);
   lastSignalAt.set(ticker, Date.now());
   const pnl    = trade.pnlPts;
@@ -876,7 +855,6 @@ app.get("/admin/reset-cooldown", (req, res) => {
   return res.json({ ok: false, message: `Brak cooldownu dla ${ticker}` });
 });
 
-// ── webhook — tryb pasywny (bot działa autonomicznie) ─────────────────────────
 app.head("/webhook", (_req, res) => res.sendStatus(200));
 app.get("/webhook",  (_req, res) => res.send("Webhook alive ✅ (bot działa w trybie autonomicznym)"));
 
@@ -886,9 +864,8 @@ app.post("/webhook", (req, res) => {
   console.log("[WEBHOOK] body:", typeof req.body === "string" ? req.body : JSON.stringify(req.body));
   console.log("[WEBHOOK] parsed:", JSON.stringify({ ticker: parsed.ticker, signal: parsed.signal, strategy: parsed.strategy }));
   return res.status(200).json({
-    ok:       true,
-    accepted: false,
-    reason:   "Bot works in autonomous scan mode now. Webhook payloads are logged but do not trigger trades.",
+    ok: true, accepted: false,
+    reason: "Bot works in autonomous scan mode now. Webhook payloads are logged but do not trigger trades.",
   });
 });
 
