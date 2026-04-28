@@ -1,4 +1,6 @@
 const express = require("express");
+const fs      = require("fs");
+const path    = require("path");
 const app = express();
 
 app.use(express.json({ type: ["application/json", "text/plain"] }));
@@ -29,38 +31,68 @@ const SESSION_START  = 6;
 const SESSION_END    = 22;
 const FRIDAY_END     = 20;
 
-// ── H1 bias config ────────────────────────────────────────────────────────────
 const H1_FAST_EMA        = 20;
 const H1_SLOW_EMA        = 50;
 const H1_CANDLES_NEEDED  = 120;
 
-// ── M15 confirmation config ───────────────────────────────────────────────────
 const M15_FAST_EMA       = 20;
 const M15_SLOW_EMA       = 50;
 const M15_CANDLES_NEEDED = 80;
 
-// ── M5 setup config ───────────────────────────────────────────────────────────
-const M5_FAST_EMA                       = 20;
-const M5_SLOW_EMA                       = 50;
-const M5_CANDLES_NEEDED                 = 60;
-const M5_RECLAIM_LOOKBACK               = 5;
-const M5_RECLAIM_MAX_EMA_DISTANCE_ATR   = 0.35;
-const M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR = 1.8;   // było 1.2
-const M5_LAST_CANDLE_MIN_BODY_TO_ATR    = 0.12;   // było 0.18
-const M5_CHOP_OVERLAP_THRESHOLD         = 0.80;
-const M5_MAX_PRESSURE_BARS              = 4;
+const M5_FAST_EMA                        = 20;
+const M5_SLOW_EMA                        = 50;
+const M5_CANDLES_NEEDED                  = 60;
+const M5_RECLAIM_LOOKBACK                = 5;
+const M5_RECLAIM_MAX_EMA_DISTANCE_ATR    = 0.35;
+const M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR = 1.8;
+const M5_LAST_CANDLE_MIN_BODY_TO_ATR     = 0.12;
+const M5_CHOP_OVERLAP_THRESHOLD          = 0.80;
+const M5_MAX_PRESSURE_BARS               = 4;
 
-// News window (minuty :25–:35 każdej godziny)
 const NEWS_WINDOW_START = 25;
 const NEWS_WINDOW_END   = 35;
+const WEBHOOK_DEDUP_MS  = 10_000;
 
-const WEBHOOK_DEDUP_MS = 10_000;
+// ── persistence ───────────────────────────────────────────────────────────────
+const TRADES_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH ?? "/tmp", "bot_state.json");
+
+function saveTrades() {
+  try {
+    const data = {
+      activeTrades:   [...activeTrades.entries()],
+      lastSignalAt:   [...lastSignalAt.entries()],
+      tradeStats,
+      tradeIdCounter,
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(TRADES_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error("[PERSIST] Błąd zapisu stanu:", e.message);
+  }
+}
+
+function loadTrades() {
+  try {
+    if (!fs.existsSync(TRADES_FILE)) return;
+    const raw  = fs.readFileSync(TRADES_FILE, "utf8");
+    const data = JSON.parse(raw);
+    for (const [k, v] of data.activeTrades ?? []) activeTrades.set(k, v);
+    for (const [k, v] of data.lastSignalAt  ?? []) lastSignalAt.set(k, v);
+    if (data.tradeStats)     Object.assign(tradeStats, data.tradeStats);
+    if (data.tradeIdCounter) tradeIdCounter = data.tradeIdCounter;
+    const openCount = [...activeTrades.values()].filter(t => t.status === "OPEN").length;
+    console.log(`[PERSIST] Stan przywrócony z ${TRADES_FILE} | open trades: ${openCount} | savedAt: ${data.savedAt}`);
+  } catch (e) {
+    console.error("[PERSIST] Błąd odczytu stanu (kontynuuję z pustym):", e.message);
+  }
+}
 
 // ── state ─────────────────────────────────────────────────────────────────────
 const activeTrades  = new Map();
 const lastSignalAt  = new Map();
 const lastWebhookAt = new Map();
 const tradeStats    = { total: 0, wins: 0, losses: 0, pnlPts: 0 };
+let tradeIdCounter  = 0;
 
 const scannerState = {
   running:          false,
@@ -82,9 +114,7 @@ const scannerStats = {
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-function r(x, d = 2) {
-  return Math.round(Number(x) * 10 ** d) / 10 ** d;
-}
+function r(x, d = 2) { return Math.round(Number(x) * 10 ** d) / 10 ** d; }
 
 function n(v, fallback = null) {
   const x = Number(v);
@@ -111,10 +141,7 @@ function getWarsawNowParts() {
   const now   = new Date();
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/Warsaw",
-    weekday: "short",
-    hour:    "numeric",
-    minute:  "numeric",
-    hour12:  false,
+    weekday: "short", hour: "numeric", minute: "numeric", hour12: false,
   }).formatToParts(now);
   return {
     weekday: parts.find(p => p.type === "weekday")?.value ?? "",
@@ -140,17 +167,14 @@ function calcEMA(closes, period) {
   if (!Array.isArray(closes) || closes.length < period) return null;
   const k = 2 / (period + 1);
   let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < closes.length; i++) {
-    ema = closes[i] * k + ema * (1 - k);
-  }
+  for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
   return ema;
 }
 
 function calcATR(candles, period = 14) {
   if (!Array.isArray(candles) || candles.length < period + 1) return null;
   const trs = candles.map((c, i, arr) => {
-    const h  = parseFloat(c.high);
-    const lo = parseFloat(c.low);
+    const h = parseFloat(c.high), lo = parseFloat(c.low);
     if (i === 0) return h - lo;
     const pc = parseFloat(arr[i - 1].close);
     return Math.max(h - lo, Math.abs(h - pc), Math.abs(lo - pc));
@@ -158,7 +182,7 @@ function calcATR(candles, period = 14) {
   return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
-// ── TwelveData helpers ────────────────────────────────────────────────────────
+// ── TwelveData ────────────────────────────────────────────────────────────────
 function toTwelveSymbol(ticker) {
   if (ticker === "XAUUSD") return "XAU/USD";
   if (ticker === "XAGUSD") return "XAG/USD";
@@ -177,10 +201,7 @@ async function fetchCandles(ticker, count = 60, interval = "1min") {
       return null;
     }
     return json.values.slice().reverse();
-  } catch (e) {
-    console.error("[CANDLES] fetch error:", e.message);
-    return null;
-  }
+  } catch (e) { console.error("[CANDLES] fetch error:", e.message); return null; }
 }
 
 async function fetchPrice(ticker) {
@@ -192,10 +213,7 @@ async function fetchPrice(ticker) {
     if (json.price) return parseFloat(json.price);
     console.warn(`[MONITOR] TwelveData: ${json.message ?? "brak ceny"}`);
     return null;
-  } catch (e) {
-    console.error("[MONITOR] fetch error:", e.message);
-    return null;
-  }
+  } catch (e) { console.error("[MONITOR] fetch error:", e.message); return null; }
 }
 
 // ── H1 bias ───────────────────────────────────────────────────────────────────
@@ -205,28 +223,22 @@ async function getH1Bias(ticker) {
     console.warn(`[H1] Za mało świec H1 (${candles?.length ?? 0})`);
     return { bias: "NEUTRAL", debug: { error: "insufficient_candles" } };
   }
-
   const closes    = candles.map(c => parseFloat(c.close));
   const price     = closes[closes.length - 1];
   const ema20     = calcEMA(closes, H1_FAST_EMA);
   const ema50     = calcEMA(closes, H1_SLOW_EMA);
   const ema20prev = calcEMA(closes.slice(0, -1), H1_FAST_EMA);
-
   if (!ema20 || !ema50 || !ema20prev) {
     console.warn("[H1] Nie można obliczyć EMA H1");
     return { bias: "NEUTRAL", debug: { error: "indicator_error" } };
   }
-
   const ema20rising  = ema20 > ema20prev;
   const ema20falling = ema20 < ema20prev;
-
   let bias = "NEUTRAL";
   if (price > ema20 && ema20 > ema50 && ema20rising)  bias = "LONG";
   if (price < ema20 && ema20 < ema50 && ema20falling) bias = "SHORT";
-
-  const debug = { price: r(price), ema20: r(ema20), ema50: r(ema50), ema20prev: r(ema20prev), ema20rising, bias };
   console.log(`[H1] bias=${bias} | price=${r(price)} EMA20=${r(ema20)} EMA50=${r(ema50)} slope=${ema20rising ? "↑" : ema20falling ? "↓" : "→"}`);
-  return { bias, debug };
+  return { bias, debug: { price: r(price), ema20: r(ema20), ema50: r(ema50), ema20rising, bias } };
 }
 
 // ── M15 confirmation ──────────────────────────────────────────────────────────
@@ -237,21 +249,16 @@ async function confirmM15Direction(ticker, bias) {
     console.warn(`[M15] ${reason}`);
     return { pass: false, reason, debug: {} };
   }
-
   const closes = candles.map(c => parseFloat(c.close));
   const price  = closes[closes.length - 1];
   const ema20  = calcEMA(closes, M15_FAST_EMA);
   const ema50  = calcEMA(closes, M15_SLOW_EMA);
-
   if (!ema20 || !ema50) {
     const reason = "REJECT_M15_INDICATOR_ERROR";
     console.warn(`[M15] ${reason}`);
     return { pass: false, reason, debug: {} };
   }
-
-  const debug = { price: r(price), ema20: r(ema20), ema50: r(ema50) };
   const rejects = [];
-
   if (bias === "LONG") {
     if (!(price > ema20)) rejects.push("M15_PRICE_BELOW_EMA20");
     if (!(ema20 > ema50)) rejects.push("M15_EMA20_BELOW_EMA50");
@@ -259,18 +266,16 @@ async function confirmM15Direction(ticker, bias) {
     if (!(price < ema20)) rejects.push("M15_PRICE_ABOVE_EMA20");
     if (!(ema20 < ema50)) rejects.push("M15_EMA20_ABOVE_EMA50");
   }
-
   if (rejects.length > 0) {
     const reason = `REJECT_M15_CONFIRMATION_FAILED (${rejects.join(", ")})`;
     console.log(`[M15] ${reason}`);
-    return { pass: false, reason, debug };
+    return { pass: false, reason, debug: { price: r(price), ema20: r(ema20), ema50: r(ema50) } };
   }
-
   console.log(`[M15] OK | price=${r(price)} EMA20=${r(ema20)} EMA50=${r(ema50)}`);
-  return { pass: true, reason: "M15_OK", debug };
+  return { pass: true, reason: "M15_OK", debug: { price: r(price), ema20: r(ema20), ema50: r(ema50) } };
 }
 
-// ── M5 setup — pullback / reclaim ─────────────────────────────────────────────
+// ── M5 setup ──────────────────────────────────────────────────────────────────
 async function checkM5Setup(ticker, bias) {
   const candles = await fetchCandles(ticker, M5_CANDLES_NEEDED, "5min");
   if (!candles || candles.length < M5_SLOW_EMA + M5_RECLAIM_LOOKBACK + 2) {
@@ -278,59 +283,45 @@ async function checkM5Setup(ticker, bias) {
     console.warn(`[M5] ${reason}`);
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
-
   const closes = candles.map(c => parseFloat(c.close));
   const highs  = candles.map(c => parseFloat(c.high));
   const lows   = candles.map(c => parseFloat(c.low));
   const last5  = candles.slice(-5);
-
   const price  = closes[closes.length - 1];
   const ema20  = calcEMA(closes, M5_FAST_EMA);
   const ema50  = calcEMA(closes, M5_SLOW_EMA);
   const atr    = calcATR(candles);
-
   if (!ema20 || !ema50 || !atr) {
     const reason = "REJECT_M5_INDICATOR_ERROR";
     console.warn(`[M5] ${reason}`);
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
-
-  const rejects = [];
+  const rejects    = [];
   const lastCandle = candles[candles.length - 1];
   const lastClose  = parseFloat(lastCandle.close);
   const lastOpen   = parseFloat(lastCandle.open);
   const lastBody   = Math.abs(lastClose - lastOpen);
-
   const lookbackCandles = candles.slice(-(M5_RECLAIM_LOOKBACK + 1), -1);
 
-  // ── 1. EMA alignment ──────────────────────────────────────────────────────
-  if (bias === "LONG") {
-    if (!(ema20 > ema50)) rejects.push("M5_EMA20_BELOW_EMA50");
-  } else {
-    if (!(ema20 < ema50)) rejects.push("M5_EMA20_ABOVE_EMA50");
-  }
+  if (bias === "LONG") { if (!(ema20 > ema50)) rejects.push("M5_EMA20_BELOW_EMA50"); }
+  else                 { if (!(ema20 < ema50)) rejects.push("M5_EMA20_ABOVE_EMA50"); }
 
-  // ── 2. Reclaim ────────────────────────────────────────────────────────────
   const maxReclaimDist = M5_RECLAIM_MAX_EMA_DISTANCE_ATR * atr;
   let reclaimFound = false;
-
   if (bias === "LONG") {
     for (const c of lookbackCandles) {
-      const low = parseFloat(c.low);
-      if (Math.abs(low - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
+      if (Math.abs(parseFloat(c.low) - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
     }
     if (!reclaimFound)
       rejects.push(`M5_NO_RECLAIM_LONG (żaden low w ostatnich ${M5_RECLAIM_LOOKBACK} świecach nie był blisko EMA20 ±${r(maxReclaimDist)} pkt)`);
   } else {
     for (const c of lookbackCandles) {
-      const high = parseFloat(c.high);
-      if (Math.abs(high - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
+      if (Math.abs(parseFloat(c.high) - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
     }
     if (!reclaimFound)
       rejects.push(`M5_NO_RECLAIM_SHORT (żaden high w ostatnich ${M5_RECLAIM_LOOKBACK} świecach nie był blisko EMA20 ±${r(maxReclaimDist)} pkt)`);
   }
 
-  // ── 3. Ostatnia świeca ────────────────────────────────────────────────────
   if (bias === "LONG") {
     if (!(lastClose > ema20)) rejects.push(`M5_LAST_CLOSE_BELOW_EMA20 (close=${r(lastClose)} ema20=${r(ema20)})`);
     if (!(lastClose > lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BULLISH");
@@ -339,16 +330,13 @@ async function checkM5Setup(ticker, bias) {
     if (!(lastClose < lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BEARISH");
   }
 
-  // ── 4. Body ───────────────────────────────────────────────────────────────
   if (lastBody < M5_LAST_CANDLE_MIN_BODY_TO_ATR * atr)
     rejects.push(`M5_LAST_CANDLE_WEAK_BODY (body=${r(lastBody)} < ${M5_LAST_CANDLE_MIN_BODY_TO_ATR}x ATR=${r(atr)})`);
 
-  // ── 5. Dystans od EMA20 ───────────────────────────────────────────────────
   const emaDistAtr = Math.abs(lastClose - ema20) / atr;
   if (emaDistAtr > M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR)
     rejects.push(`M5_TOO_FAR_FROM_EMA (${emaDistAtr.toFixed(2)}x ATR > max ${M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR}x ATR)`);
 
-  // ── 6. Chop filter ────────────────────────────────────────────────────────
   let choppyPairs = 0;
   for (let i = 1; i < last5.length; i++) {
     const pH = parseFloat(last5[i-1].high), pL = parseFloat(last5[i-1].low);
@@ -360,12 +348,11 @@ async function checkM5Setup(ticker, bias) {
   if (choppyPairs >= 3)
     rejects.push(`M5_CHOP (${choppyPairs}/4 par nakłada się > ${M5_CHOP_OVERLAP_THRESHOLD * 100}%)`);
 
-  // ── 7. Overextension ──────────────────────────────────────────────────────
   let pressureBars = 0;
   for (let i = last5.length - 1; i >= 0; i--) {
     const isBull = parseFloat(last5[i].close) > parseFloat(last5[i].open);
     const isBear = parseFloat(last5[i].close) < parseFloat(last5[i].open);
-    if (bias === "LONG"  && isBull) pressureBars++;
+    if (bias === "LONG" && isBull) pressureBars++;
     else if (bias === "SHORT" && isBear) pressureBars++;
     else break;
   }
@@ -384,7 +371,6 @@ async function checkM5Setup(ticker, bias) {
     console.log(`[M5] ${reason}`);
     return { pass: false, reason, atr: r(atr), entry: null, debug };
   }
-
   console.log(`[M5] OK — reclaim CONFIRMED | close=${r(lastClose)} EMA20=${r(ema20)} ATR=${r(atr)} dist=${emaDistAtr.toFixed(2)}x`);
   return { pass: true, reason: "M5_OK", atr: r(atr), entry: r(lastClose), debug };
 }
@@ -408,15 +394,12 @@ function buildLevels(signal, entry, atr) {
   const tp1 = r(entry + dir * slD * TP1_MULTIPLIER);
   const tp2 = r(entry + dir * slD * TP2_MULTIPLIER);
   const tp3 = r(entry + dir * slD * TP3_MULTIPLIER);
-  const risk    = Math.abs(entry - sl);
-  const reward1 = Math.abs(tp1 - entry);
-  const reward2 = Math.abs(tp2 - entry);
-  const reward3 = Math.abs(tp3 - entry);
+  const risk = Math.abs(entry - sl);
   return {
     entry, sl, tp1, tp2, tp3,
-    rr1: r(risk > 0 ? reward1 / risk : 0),
-    rr2: r(risk > 0 ? reward2 / risk : 0),
-    rr3: r(risk > 0 ? reward3 / risk : 0),
+    rr1: r(risk > 0 ? Math.abs(tp1 - entry) / risk : 0),
+    rr2: r(risk > 0 ? Math.abs(tp2 - entry) / risk : 0),
+    rr3: r(risk > 0 ? Math.abs(tp3 - entry) / risk : 0),
     slDist:  r(slD),
     tp1Dist: r(slD * TP1_MULTIPLIER),
     tp2Dist: r(slD * TP2_MULTIPLIER),
@@ -460,8 +443,6 @@ function canOpen(ticker, signal, entry, atr) {
 }
 
 // ── trade management ──────────────────────────────────────────────────────────
-let tradeIdCounter = 0;
-
 function registerTrade(ticker, signal, levels) {
   tradeIdCounter++;
   activeTrades.set(ticker, {
@@ -474,6 +455,7 @@ function registerTrade(ticker, signal, levels) {
   });
   lastSignalAt.set(ticker, Date.now());
   tradeStats.total++;
+  saveTrades();
 }
 
 function closeTrade(ticker, closePrice, reason) {
@@ -490,6 +472,7 @@ function closeTrade(ticker, closePrice, reason) {
   if (reason.startsWith("TP")) tradeStats.wins++;
   else if (reason === "SL")    tradeStats.losses++;
   tradeStats.pnlPts = r(tradeStats.pnlPts + pnl);
+  saveTrades();
 }
 
 // ── telegram ──────────────────────────────────────────────────────────────────
@@ -519,32 +502,33 @@ async function sendTelegram(text) {
   if (!BOT_TOKEN) { console.error("[TG] TELEGRAM_TOKEN nie ustawiony"); return { ok: false, error: "no token" }; }
   try {
     const res  = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-      method:  "POST",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML" }),
+      body:   JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML" }),
     });
     const json = await res.json();
     if (!json.ok) { console.error("[TG] Telegram error:", json.description); return { ok: false, error: json.description }; }
     console.log("[TG] Wiadomość wysłana OK");
     return { ok: true };
-  } catch (e) {
-    console.error("[TG] fetch error:", e.message);
-    return { ok: false, error: String(e) };
-  }
+  } catch (e) { console.error("[TG] fetch error:", e.message); return { ok: false, error: String(e) }; }
 }
 
 // ── price monitor ─────────────────────────────────────────────────────────────
 async function checkTrades() {
   for (const [ticker, trade] of activeTrades.entries()) {
     if (trade.status !== "OPEN") continue;
+
     const price = await fetchPrice(ticker);
     if (price === null) continue;
+
     const isLong = trade.signal === "LONG";
 
+    // TP1
     if (!trade.tp1Hit && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
       trade.tp1Hit = true;
       trade.sl     = trade.entry;
-      const pnl1   = r(Math.abs(trade.tp1 - trade.entry));
+      saveTrades();
+      const pnl1 = r(Math.abs(trade.tp1 - trade.entry));
       await sendTelegram(
         `🎯 <b>TP1 HIT — ${ticker} #${trade.id}</b>\n` +
         `Wejście: <code>${trade.entry}</code> → TP1: <code>${r(trade.tp1)}</code>\n` +
@@ -555,11 +539,13 @@ async function checkTrades() {
       );
     }
 
+    // TP2
     if (!trade.tp2Hit && (isLong ? price >= trade.tp2 : price <= trade.tp2)) {
       trade.tp1Hit = true;
       trade.tp2Hit = true;
       trade.sl     = trade.tp1;
-      const pnl2   = r(Math.abs(trade.tp2 - trade.entry));
+      saveTrades();
+      const pnl2 = r(Math.abs(trade.tp2 - trade.entry));
       await sendTelegram(
         `🎯🎯 <b>TP2 HIT — ${ticker} #${trade.id}</b>\n` +
         `Wejście: <code>${trade.entry}</code> → TP2: <code>${r(trade.tp2)}</code>\n` +
@@ -570,6 +556,7 @@ async function checkTrades() {
       );
     }
 
+    // TP3
     if (isLong ? price >= trade.tp3 : price <= trade.tp3) {
       const pnl3 = r(Math.abs(trade.tp3 - trade.entry));
       closeTrade(ticker, price, "TP3");
@@ -584,6 +571,7 @@ async function checkTrades() {
       continue;
     }
 
+    // SL
     if (isLong ? price <= trade.sl : price >= trade.sl) {
       const slLabel            = trade.tp2Hit ? "TP1 (profit chroniony)" : trade.tp1Hit ? "entry (breakeven)" : "oryginalny SL";
       const executedClosePrice = trade.sl;
@@ -627,18 +615,15 @@ async function scanXAUUSD() {
     console.log(`[SCAN] Aktywny trade #${active.id} ${active.signal} @ ${active.entry} — pomijam scan`);
     return;
   }
-
   scannerStats.totalScans++;
-
   const h1 = await getH1Bias(ticker);
   scannerState.lastH1Bias = h1.bias;
   if (h1.bias === "NEUTRAL") {
     scannerStats.h1Neutral++;
-    console.log(`[SCAN] REJECT — H1 NEUTRAL (brak jasnego trendu)`);
+    console.log(`[SCAN] REJECT — H1 NEUTRAL`);
     return;
   }
   const signal = h1.bias;
-
   const m15 = await confirmM15Direction(ticker, signal);
   scannerState.lastM15Result = m15.reason;
   if (!m15.pass) {
@@ -646,7 +631,6 @@ async function scanXAUUSD() {
     console.log(`[SCAN] REJECT — M15: ${m15.reason}`);
     return;
   }
-
   const m5 = await checkM5Setup(ticker, signal);
   scannerState.lastM5Result = m5.reason;
   if (!m5.pass) {
@@ -654,27 +638,23 @@ async function scanXAUUSD() {
     console.log(`[SCAN] REJECT — M5: ${m5.reason}`);
     return;
   }
-
   const entry = m5.entry;
   const atr   = m5.atr;
-
   if (!Number.isFinite(entry) || !Number.isFinite(atr)) {
     console.log(`[SCAN] REJECT — brak entry lub ATR po M5 OK`);
     return;
   }
-
   const decision = canOpen(ticker, signal, entry, atr);
   if (!decision.ok) {
     scannerStats.canOpenRejected++;
     console.log(`[SCAN] REJECT — canOpen: ${decision.reason}`);
     return;
   }
-
   const levels = decision.levels;
   registerTrade(ticker, signal, levels);
   scannerStats.entriesOpened++;
   await sendTelegram(formatEntry(ticker, signal, levels, atr, "M5", "AUTONOMOUS_SCAN"));
-  console.log(`[ENTRY] #${activeTrades.get(ticker).id} ${signal} ${ticker} @ ${entry} ATR=${r(atr)} H1=${h1.bias} [AUTONOMOUS]`);
+  console.log(`[ENTRY] #${activeTrades.get(ticker).id} ${signal} ${ticker} @ ${entry} ATR=${r(atr)} [AUTONOMOUS]`);
 }
 
 // ── signal scanner ────────────────────────────────────────────────────────────
@@ -683,49 +663,36 @@ function startSignalScanner() {
     console.warn("[SCAN] TWELVEDATA_API_KEY nie ustawiony — scanner wyłączony");
     return;
   }
-
   scannerState.running = true;
   console.log("[SCAN] Autonomiczny scanner uruchomiony (interwał 60s, trigger: nowa świeca M5)");
 
   setInterval(async () => {
     scannerState.lastScanAt = new Date().toISOString();
-
     if (scannerState.isScanning) {
       console.log("[SCAN] previous scan still running — skip");
       return;
     }
-
     const activeNow = activeTrades.get("XAUUSD");
     if (activeNow?.status === "OPEN") {
       console.log(`[SCAN] Trade #${activeNow.id} otwarty — pomijam polling świec (oszczędzam API)`);
       return;
     }
-
     try {
       const candles = await fetchCandles("XAUUSD", 3, "5min");
       if (!candles || candles.length < 2) {
         console.log("[SCAN] Brak danych świec M5 — pomijam");
         return;
       }
-
       const lastClosed = candles[candles.length - 2];
       const candleTime = lastClosed.datetime;
-
       if (candleTime === scannerState.lastM5CandleTime) {
         console.log(`[SCAN] no new M5 candle (last: ${candleTime})`);
         return;
       }
-
       scannerState.lastM5CandleTime = candleTime;
       console.log(`[SCAN] new M5 candle detected — ${candleTime} — uruchamiam scan`);
-
       scannerState.isScanning = true;
-      try {
-        await scanXAUUSD();
-      } finally {
-        scannerState.isScanning = false;
-      }
-
+      try { await scanXAUUSD(); } finally { scannerState.isScanning = false; }
     } catch (err) {
       console.error("[SCAN] błąd:", err.message);
       scannerState.isScanning = false;
@@ -819,7 +786,7 @@ app.get("/test-signal", async (_req, res) => {
       formatEntry("XAUUSD", "LONG", levels, atr, "M5", "TEST") +
       `\n\n<i>⚠️ To jest sygnał testowy, nie wchodzić w pozycję!</i>`
     );
-    res.json({ ok: true, telegram: tgResult, entry, atr, levels, m5debug: m5.debug, note: "Test signal sent. H1/M15 filters bypassed." });
+    res.json({ ok: true, telegram: tgResult, entry, atr, levels, m5debug: m5.debug });
   } catch (err) { res.json({ ok: false, error: String(err) }); }
 });
 
@@ -832,8 +799,7 @@ app.get("/admin/close", async (req, res) => {
   const price = await fetchPrice(ticker) ?? trade.entry;
   closeTrade(ticker, price, reason);
   lastSignalAt.set(ticker, Date.now());
-  const pnl    = trade.pnlPts;
-  const pnlStr = pnl >= 0 ? `+${pnl}` : `${pnl}`;
+  const pnlStr = trade.pnlPts >= 0 ? `+${trade.pnlPts}` : `${trade.pnlPts}`;
   await sendTelegram(
     `🔧 <b>RĘCZNE ZAMKNIĘCIE — ${ticker} #${trade.id}</b>\n` +
     `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
@@ -841,14 +807,14 @@ app.get("/admin/close", async (req, res) => {
     `💵 <b>P&L: <code>${pnlStr} pkt</code></b>\n` +
     `<i>${new Date().toUTCString()}</i>`
   );
-  console.log(`[ADMIN] Ręcznie zamknięto ${ticker} @ ${r(price)} (${reason}), P&L: ${pnlStr} pkt`);
-  return res.json({ ok: true, ticker, closePrice: r(price), pnlPts: pnl, reason });
+  return res.json({ ok: true, ticker, closePrice: r(price), pnlPts: trade.pnlPts, reason });
 });
 
 app.get("/admin/reset-cooldown", (req, res) => {
   const ticker = String(req.query.ticker ?? "XAUUSD").toUpperCase();
   if (lastSignalAt.has(ticker)) {
     lastSignalAt.delete(ticker);
+    saveTrades();
     console.log(`[ADMIN] Cooldown zresetowany dla ${ticker}`);
     return res.json({ ok: true, message: `Cooldown zresetowany dla ${ticker}` });
   }
@@ -873,6 +839,7 @@ app.post("/webhook", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🤖 Gold Bot nasłuchuje na porcie ${PORT}`);
+  loadTrades();
   startPriceMonitor();
   startSignalScanner();
 });
