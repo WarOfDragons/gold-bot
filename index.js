@@ -29,10 +29,10 @@ const MAX_SL_DIST    = 22.0;
 const COOLDOWN_MS    = 10 * 60 * 1000;
 
 // ── structure SL config ───────────────────────────────────────────────────────
-const STRUCTURE_SL_LOOKBACK = 15;   // ile świec M5 wstecz szukamy swing high/low
-const STRUCTURE_SL_BUFFER   = 1.0;  // pkt poza strukturą
+const STRUCTURE_SL_LOOKBACK = 15;
+const STRUCTURE_SL_BUFFER   = 1.0;
 // ── trailing stop config ──────────────────────────────────────────────────────
-const TRAIL_ATR_FACTOR      = 0.8;  // trail SL w odległości 0.8×ATR od szczytu
+const TRAIL_ATR_FACTOR      = 0.8;
 
 const SESSION_START  = 6;
 const SESSION_END    = 22;
@@ -49,22 +49,19 @@ const M15_SLOW_EMA       = 50;
 const M15_CANDLES_NEEDED = 80;
 
 // ── M5 setup config ───────────────────────────────────────────────────────────
-const M5_FAST_EMA                       = 20;
-const M5_SLOW_EMA                       = 50;
-const M5_CANDLES_NEEDED                 = 60;
-const M5_RECLAIM_LOOKBACK               = 5;
-const M5_RECLAIM_MAX_EMA_DISTANCE_ATR   = 0.35;
+const M5_FAST_EMA                        = 20;
+const M5_SLOW_EMA                        = 50;
+const M5_CANDLES_NEEDED                  = 60;
+const M5_RECLAIM_LOOKBACK                = 5;
+const M5_RECLAIM_MAX_EMA_DISTANCE_ATR    = 0.35;
 const M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR = 1.8;
-const M5_LAST_CANDLE_MIN_BODY_TO_ATR    = 0.12;
-const M5_CHOP_OVERLAP_THRESHOLD         = 0.80;
-const M5_MAX_PRESSURE_BARS              = 4;
+const M5_LAST_CANDLE_MIN_BODY_TO_ATR     = 0.12;
+const M5_CHOP_OVERLAP_THRESHOLD          = 0.80;
+const M5_MAX_PRESSURE_BARS               = 4;
 
-// News window (minuty :25–:35 każdej godziny)
 const NEWS_WINDOW_START = 25;
 const NEWS_WINDOW_END   = 35;
-
-// Dedup webhooka — odrzuca ten sam sygnał na tym samym tickerze w ciągu N sekund
-const WEBHOOK_DEDUP_MS = 10_000;
+const WEBHOOK_DEDUP_MS  = 10_000;
 
 // ── persistence ───────────────────────────────────────────────────────────────
 const TRADES_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH ?? "/tmp", "bot_state.json");
@@ -91,7 +88,7 @@ function loadTrades() {
     const data = JSON.parse(raw);
     for (const [k, v] of data.activeTrades ?? []) activeTrades.set(k, v);
     for (const [k, v] of data.lastSignalAt  ?? []) lastSignalAt.set(k, v);
-    if (data.tradeStats)    Object.assign(tradeStats, data.tradeStats);
+    if (data.tradeStats)     Object.assign(tradeStats, data.tradeStats);
     if (data.tradeIdCounter) tradeIdCounter = data.tradeIdCounter;
     const openCount = [...activeTrades.values()].filter(t => t.status === "OPEN").length;
     console.log(`[PERSIST] Stan przywrócony z ${TRADES_FILE} | open trades: ${openCount} | savedAt: ${data.savedAt}`);
@@ -107,7 +104,6 @@ const lastWebhookAt = new Map();
 const tradeStats    = { total: 0, wins: 0, losses: 0, pnlPts: 0 };
 let tradeIdCounter  = 0;
 
-// Scanner state
 const scannerState = {
   running:          false,
   isScanning:       false,
@@ -118,7 +114,6 @@ const scannerState = {
   lastM5Result:     null,
 };
 
-// Scanner diagnostic stats
 const scannerStats = {
   totalScans:      0,
   h1Neutral:       0,
@@ -206,11 +201,9 @@ function calcATR(candles, period = 14) {
 }
 
 // ── structure SL ──────────────────────────────────────────────────────────────
-// Szuka swing low (LONG) lub swing high (SHORT) z ostatnich N świec M5
-// Zwraca odległość SL od entry (slD) już ograniczoną do MIN/MAX
 function findStructureSL(candles, bias, entry) {
   const lookback = Math.min(STRUCTURE_SL_LOOKBACK, candles.length - 2);
-  const slice    = candles.slice(-(lookback + 1), -1); // wyklucz ostatnią (niezamkniętą)
+  const slice    = candles.slice(-(lookback + 1), -1);
   let slD;
   if (bias === "LONG") {
     const swingLow = Math.min(...slice.map(c => parseFloat(c.low)));
@@ -271,25 +264,20 @@ async function getH1Bias(ticker) {
     console.warn(`[H1] Za mało świec H1 (${candles?.length ?? 0})`);
     return { bias: "NEUTRAL", debug: { error: "insufficient_candles" } };
   }
-
   const closes    = candles.map(c => parseFloat(c.close));
   const price     = closes[closes.length - 1];
   const ema20     = calcEMA(closes, H1_FAST_EMA);
   const ema50     = calcEMA(closes, H1_SLOW_EMA);
   const ema20prev = calcEMA(closes.slice(0, -1), H1_FAST_EMA);
-
   if (!ema20 || !ema50 || !ema20prev) {
     console.warn("[H1] Nie można obliczyć EMA H1");
     return { bias: "NEUTRAL", debug: { error: "indicator_error" } };
   }
-
   const ema20rising  = ema20 > ema20prev;
   const ema20falling = ema20 < ema20prev;
-
   let bias = "NEUTRAL";
   if (price > ema20 && ema20 > ema50 && ema20rising)  bias = "LONG";
   if (price < ema20 && ema20 < ema50 && ema20falling) bias = "SHORT";
-
   const debug = { price: r(price), ema20: r(ema20), ema50: r(ema50), ema20prev: r(ema20prev), ema20rising, bias };
   console.log(`[H1] bias=${bias} | price=${r(price)} EMA20=${r(ema20)} EMA50=${r(ema50)} slope=${ema20rising ? "↑" : ema20falling ? "↓" : "→"}`);
   return { bias, debug };
@@ -303,21 +291,17 @@ async function confirmM15Direction(ticker, bias) {
     console.warn(`[M15] ${reason}`);
     return { pass: false, reason, debug: {} };
   }
-
   const closes = candles.map(c => parseFloat(c.close));
   const price  = closes[closes.length - 1];
   const ema20  = calcEMA(closes, M15_FAST_EMA);
   const ema50  = calcEMA(closes, M15_SLOW_EMA);
-
   if (!ema20 || !ema50) {
     const reason = "REJECT_M15_INDICATOR_ERROR";
     console.warn(`[M15] ${reason}`);
     return { pass: false, reason, debug: {} };
   }
-
   const debug = { price: r(price), ema20: r(ema20), ema50: r(ema50) };
   const rejects = [];
-
   if (bias === "LONG") {
     if (!(price > ema20)) rejects.push("M15_PRICE_BELOW_EMA20");
     if (!(ema20 > ema50)) rejects.push("M15_EMA20_BELOW_EMA50");
@@ -325,13 +309,11 @@ async function confirmM15Direction(ticker, bias) {
     if (!(price < ema20)) rejects.push("M15_PRICE_ABOVE_EMA20");
     if (!(ema20 < ema50)) rejects.push("M15_EMA20_ABOVE_EMA50");
   }
-
   if (rejects.length > 0) {
     const reason = `REJECT_M15_CONFIRMATION_FAILED (${rejects.join(", ")})`;
     console.log(`[M15] ${reason}`);
     return { pass: false, reason, debug };
   }
-
   console.log(`[M15] OK | price=${r(price)} EMA20=${r(ema20)} EMA50=${r(ema50)}`);
   return { pass: true, reason: "M15_OK", debug };
 }
@@ -344,66 +326,48 @@ async function checkM5Setup(ticker, bias) {
     console.warn(`[M5] ${reason}`);
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
-
   const closes = candles.map(c => parseFloat(c.close));
   const highs  = candles.map(c => parseFloat(c.high));
   const lows   = candles.map(c => parseFloat(c.low));
   const last5  = candles.slice(-5);
-
   const price  = closes[closes.length - 1];
   const ema20  = calcEMA(closes, M5_FAST_EMA);
   const ema50  = calcEMA(closes, M5_SLOW_EMA);
   const atr    = calcATR(candles);
-
   if (!ema20 || !ema50 || !atr) {
     const reason = "REJECT_M5_INDICATOR_ERROR";
     console.warn(`[M5] ${reason}`);
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
-
-  const rejects = [];
+  const rejects    = [];
   const lastCandle = candles[candles.length - 1];
   const lastClose  = parseFloat(lastCandle.close);
   const lastOpen   = parseFloat(lastCandle.open);
   const lastBody   = Math.abs(lastClose - lastOpen);
-
-  // Lookback window — świece przed ostatnią (nie licząc ostatniej)
   const lookbackCandles = candles.slice(-(M5_RECLAIM_LOOKBACK + 1), -1);
 
-  // ── 1. EMA alignment ──────────────────────────────────────────────────────
   if (bias === "LONG") {
     if (!(ema20 > ema50)) rejects.push("M5_EMA20_BELOW_EMA50");
   } else {
     if (!(ema20 < ema50)) rejects.push("M5_EMA20_ABOVE_EMA50");
   }
 
-  // ── 2. Reclaim — cena zbliżyła się do EMA20 w lookback window ─────────────
   const maxReclaimDist = M5_RECLAIM_MAX_EMA_DISTANCE_ATR * atr;
   let reclaimFound = false;
-
   if (bias === "LONG") {
     for (const c of lookbackCandles) {
-      const low = parseFloat(c.low);
-      if (Math.abs(low - ema20) <= maxReclaimDist) {
-        reclaimFound = true;
-        break;
-      }
+      if (Math.abs(parseFloat(c.low) - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
     }
     if (!reclaimFound)
       rejects.push(`M5_NO_RECLAIM_LONG (żaden low w ostatnich ${M5_RECLAIM_LOOKBACK} świecach nie był blisko EMA20 ±${r(maxReclaimDist)} pkt)`);
   } else {
     for (const c of lookbackCandles) {
-      const high = parseFloat(c.high);
-      if (Math.abs(high - ema20) <= maxReclaimDist) {
-        reclaimFound = true;
-        break;
-      }
+      if (Math.abs(parseFloat(c.high) - ema20) <= maxReclaimDist) { reclaimFound = true; break; }
     }
     if (!reclaimFound)
       rejects.push(`M5_NO_RECLAIM_SHORT (żaden high w ostatnich ${M5_RECLAIM_LOOKBACK} świecach nie był blisko EMA20 ±${r(maxReclaimDist)} pkt)`);
   }
 
-  // ── 3. Ostatnia świeca — zamknięcie po właściwej stronie EMA20 ─────────────
   if (bias === "LONG") {
     if (!(lastClose > ema20)) rejects.push(`M5_LAST_CLOSE_BELOW_EMA20 (close=${r(lastClose)} ema20=${r(ema20)})`);
     if (!(lastClose > lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BULLISH");
@@ -412,16 +376,13 @@ async function checkM5Setup(ticker, bias) {
     if (!(lastClose < lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BEARISH");
   }
 
-  // ── 4. Body ostatniej świecy ──────────────────────────────────────────────
   if (lastBody < M5_LAST_CANDLE_MIN_BODY_TO_ATR * atr)
     rejects.push(`M5_LAST_CANDLE_WEAK_BODY (body=${r(lastBody)} < ${M5_LAST_CANDLE_MIN_BODY_TO_ATR}x ATR=${r(atr)})`);
 
-  // ── 5. Dystans od EMA20 po wejściu ────────────────────────────────────────
   const emaDistAtr = Math.abs(lastClose - ema20) / atr;
   if (emaDistAtr > M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR)
     rejects.push(`M5_TOO_FAR_FROM_EMA (${emaDistAtr.toFixed(2)}x ATR > max ${M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR}x ATR)`);
 
-  // ── 6. Chop filter ────────────────────────────────────────────────────────
   let choppyPairs = 0;
   for (let i = 1; i < last5.length; i++) {
     const pH = parseFloat(last5[i-1].high), pL = parseFloat(last5[i-1].low);
@@ -433,7 +394,6 @@ async function checkM5Setup(ticker, bias) {
   if (choppyPairs >= 3)
     rejects.push(`M5_CHOP (${choppyPairs}/4 par nakłada się > ${M5_CHOP_OVERLAP_THRESHOLD * 100}%)`);
 
-  // ── 7. Overextension ──────────────────────────────────────────────────────
   let pressureBars = 0;
   for (let i = last5.length - 1; i >= 0; i--) {
     const isBull = parseFloat(last5[i].close) > parseFloat(last5[i].open);
@@ -446,19 +406,10 @@ async function checkM5Setup(ticker, bias) {
     rejects.push(`M5_OVEREXTENDED (${pressureBars} świec z rzędu > max ${M5_MAX_PRESSURE_BARS})`);
 
   const debug = {
-    price:       r(price),
-    ema20:       r(ema20),
-    ema50:       r(ema50),
-    atr:         r(atr),
-    reclaimFound,
-    reclaimWindowBars: M5_RECLAIM_LOOKBACK,
-    reclaimMaxDist:    r(maxReclaimDist),
-    lastClose:   r(lastClose),
-    lastOpen:    r(lastOpen),
-    lastBody:    r(lastBody),
-    emaDistAtr:  `${emaDistAtr.toFixed(2)}x`,
-    choppyPairs,
-    pressureBars,
+    price: r(price), ema20: r(ema20), ema50: r(ema50), atr: r(atr),
+    reclaimFound, reclaimWindowBars: M5_RECLAIM_LOOKBACK, reclaimMaxDist: r(maxReclaimDist),
+    lastClose: r(lastClose), lastOpen: r(lastOpen), lastBody: r(lastBody),
+    emaDistAtr: `${emaDistAtr.toFixed(2)}x`, choppyPairs, pressureBars,
   };
 
   if (rejects.length > 0) {
@@ -472,7 +423,7 @@ async function checkM5Setup(ticker, bias) {
   return { pass: true, reason: "M5_OK", atr: r(atr), entry: r(lastClose), slD, debug };
 }
 
-// ── position sizing (info only) ───────────────────────────────────────────────
+// ── position sizing ───────────────────────────────────────────────────────────
 function calcLotSize(entry, sl) {
   const riskAmount = ACCOUNT_BALANCE * (RISK_PERCENT / 100);
   const slDistance = Math.abs(entry - sl);
@@ -483,20 +434,16 @@ function calcLotSize(entry, sl) {
 }
 
 // ── levels builder ────────────────────────────────────────────────────────────
-// slD = odległość SL od entry (structure-based, już ograniczona)
 function buildLevels(signal, entry, slD) {
   const dir = signal === "LONG" ? 1 : -1;
-
   const sl  = r(entry - dir * slD);
   const tp1 = r(entry + dir * slD * TP1_MULTIPLIER);
   const tp2 = r(entry + dir * slD * TP2_MULTIPLIER);
   const tp3 = r(entry + dir * slD * TP3_MULTIPLIER);
-
   const risk    = Math.abs(entry - sl);
   const reward1 = Math.abs(tp1 - entry);
   const reward2 = Math.abs(tp2 - entry);
   const reward3 = Math.abs(tp3 - entry);
-
   return {
     entry, sl, tp1, tp2, tp3,
     rr1:     r(risk > 0 ? reward1 / risk : 0),
@@ -507,9 +454,7 @@ function buildLevels(signal, entry, slD) {
     tp2Dist: r(slD * TP2_MULTIPLIER),
     tp3Dist: r(slD * TP3_MULTIPLIER),
   };
-}
-
-// ── gate checks ───────────────────────────────────────────────────────────────
+}// ── gate checks ───────────────────────────────────────────────────────────────
 function canOpen(ticker, signal, entry, atr, slD) {
   if (atr < MIN_ATR) return { ok: false, reason: `ATR za niskie (${atr.toFixed(2)} < ${MIN_ATR})` };
   if (atr > MAX_ATR) return { ok: false, reason: `ATR za wysokie (${atr.toFixed(2)} > ${MAX_ATR})` };
@@ -569,8 +514,8 @@ function registerTrade(ticker, signal, levels, atr) {
     openedAt:    new Date().toUTCString(),
     tp1Hit:      false,
     tp2Hit:      false,
-    peakPrice:   levels.entry,    // śledzenie szczytu do trailing
-    tradeAtr:    atr,             // ATR przy wejściu — do trailing
+    peakPrice:   levels.entry,
+    tradeAtr:    atr,
     closedAt:    null,
     closePrice:  null,
     closeReason: null,
@@ -592,11 +537,8 @@ function closeTrade(ticker, closePrice, reason) {
   trade.closePrice  = r(closePrice);
   trade.closeReason = reason;
   trade.pnlPts      = pnl;
-  if (reason.startsWith("TP")) {
-    tradeStats.wins++;
-  } else if (reason === "SL") {
-    tradeStats.losses++;
-  }
+  if (reason.startsWith("TP")) { tradeStats.wins++; }
+  else if (reason === "SL")    { tradeStats.losses++; }
   tradeStats.pnlPts = r(tradeStats.pnlPts + pnl);
   saveTrades();
 }
@@ -646,18 +588,15 @@ async function sendTelegram(text) {
 async function checkTrades() {
   for (const [ticker, trade] of activeTrades.entries()) {
     if (trade.status !== "OPEN") continue;
-
     const price = await fetchPrice(ticker);
     if (price === null) continue;
-
     const isLong = trade.signal === "LONG";
 
     // TP1
     if (!trade.tp1Hit && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
-      trade.tp1Hit  = true;
+      trade.tp1Hit    = true;
       trade.peakPrice = price;
-      // Trailing start — SL za ceną o TRAIL_ATR_FACTOR×ATR, nie mniej niż entry+1
-      const trailAtr = trade.tradeAtr ?? DEFAULT_ATR;
+      const trailAtr  = trade.tradeAtr ?? DEFAULT_ATR;
       const initialTrailSL = isLong
         ? r(Math.max(price - TRAIL_ATR_FACTOR * trailAtr, trade.entry + 1.0))
         : r(Math.min(price + TRAIL_ATR_FACTOR * trailAtr, trade.entry - 1.0));
@@ -674,9 +613,9 @@ async function checkTrades() {
       );
     }
 
-    // Trailing update — przesuwa SL za ceną po TP1 (do TP2 hit)
+    // Trailing update
     if (trade.tp1Hit && !trade.tp2Hit) {
-      const trailAtr = trade.tradeAtr ?? DEFAULT_ATR;
+      const trailAtr  = trade.tradeAtr ?? DEFAULT_ATR;
       const isNewPeak = isLong ? price > trade.peakPrice : price < trade.peakPrice;
       if (isNewPeak) {
         trade.peakPrice = price;
@@ -764,17 +703,13 @@ function startPriceMonitor() {
 // ── autonomous scan ───────────────────────────────────────────────────────────
 async function scanXAUUSD() {
   const ticker = "XAUUSD";
-
-  // 1. Aktywny trade → skip
   const active = activeTrades.get(ticker);
   if (active?.status === "OPEN") {
     console.log(`[SCAN] Aktywny trade #${active.id} ${active.signal} @ ${active.entry} — pomijam scan`);
     return;
   }
-
   scannerStats.totalScans++;
 
-  // 2. H1 bias
   const h1 = await getH1Bias(ticker);
   scannerState.lastH1Bias = h1.bias;
   if (h1.bias === "NEUTRAL") {
@@ -784,7 +719,6 @@ async function scanXAUUSD() {
   }
   const signal = h1.bias;
 
-  // 3. M15 confirmation
   const m15 = await confirmM15Direction(ticker, signal);
   scannerState.lastM15Result = m15.reason;
   if (!m15.pass) {
@@ -793,7 +727,6 @@ async function scanXAUUSD() {
     return;
   }
 
-  // 4. M5 reclaim setup
   const m5 = await checkM5Setup(ticker, signal);
   scannerState.lastM5Result = m5.reason;
   if (!m5.pass) {
@@ -811,7 +744,6 @@ async function scanXAUUSD() {
     return;
   }
 
-  // 5. Gate checks (sesja, cooldown, news, RR)
   const decision = canOpen(ticker, signal, entry, atr, slD);
   if (!decision.ok) {
     scannerStats.canOpenRejected++;
@@ -819,7 +751,6 @@ async function scanXAUUSD() {
     return;
   }
 
-  // 6. Otwórz trade
   const levels = decision.levels;
   registerTrade(ticker, signal, levels, atr);
   scannerStats.entriesOpened++;
@@ -827,59 +758,46 @@ async function scanXAUUSD() {
   console.log(`[ENTRY] #${activeTrades.get(ticker).id} ${signal} ${ticker} @ ${entry} ATR=${r(atr)} H1=${h1.bias} [AUTONOMOUS]`);
 }
 
-// ── signal scanner (co zamknięcie świecy M5) ──────────────────────────────────
+// ── signal scanner ────────────────────────────────────────────────────────────
 function startSignalScanner() {
   if (!TWELVEDATA_KEY) {
     console.warn("[SCAN] TWELVEDATA_API_KEY nie ustawiony — scanner wyłączony");
     return;
   }
-
   scannerState.running = true;
   console.log("[SCAN] Autonomiczny scanner uruchomiony (interwał 60s, trigger: nowa świeca M5)");
 
   setInterval(async () => {
     scannerState.lastScanAt = new Date().toISOString();
-
     if (scannerState.isScanning) {
       console.log("[SCAN] previous scan still running — skip");
       return;
     }
-
     const activeNow = activeTrades.get("XAUUSD");
     if (activeNow?.status === "OPEN") {
       console.log(`[SCAN] Trade #${activeNow.id} otwarty — pomijam polling świec (oszczędzam API)`);
       return;
     }
-
     try {
-      // Pobierz ostatnią zamkniętą świecę M5
       const candles = await fetchCandles("XAUUSD", 3, "5min");
       if (!candles || candles.length < 2) {
         console.log("[SCAN] Brak danych świec M5 — pomijam");
         return;
       }
-
-      // Ostatnia zamknięta świeca to candles[length-2]
-      // (candles[length-1] to bieżąca, niezamknięta)
       const lastClosed = candles[candles.length - 2];
       const candleTime = lastClosed.datetime;
-
       if (candleTime === scannerState.lastM5CandleTime) {
         console.log(`[SCAN] no new M5 candle (last: ${candleTime})`);
         return;
       }
-
-      // Nowa zamknięta świeca
       scannerState.lastM5CandleTime = candleTime;
       console.log(`[SCAN] new M5 candle detected — ${candleTime} — uruchamiam scan`);
-
       scannerState.isScanning = true;
       try {
         await scanXAUUSD();
       } finally {
         scannerState.isScanning = false;
       }
-
     } catch (err) {
       console.error("[SCAN] błąd:", err.message);
       scannerState.isScanning = false;
@@ -891,7 +809,7 @@ function startSignalScanner() {
 function tryParseJson(v) { try { return JSON.parse(v); } catch { return {}; } }
 
 function parseWebhookPayload(body) {
-  const raw = typeof body === "string" ? tryParseJson(body) : body ?? {};
+  const raw      = typeof body === "string" ? tryParseJson(body) : body ?? {};
   const signal   = normalizeSignal(raw.signal ?? raw.side ?? raw.action ?? raw.order_action ?? raw.direction);
   const ticker   = normalizeTicker(raw.ticker ?? raw.symbol ?? raw.instrument ?? raw.market ?? "XAUUSD");
   const entry    = n(raw.entry ?? raw.price ?? raw.close ?? raw.last ?? raw.trigger_price, null);
@@ -943,13 +861,13 @@ app.get("/status", (_req, res) => {
     recentTrades:        trades.filter(t => t.status === "CLOSED").slice(-10),
     cooldowns,
     scanner: {
-      running:              scannerState.running,
-      isScanning:           scannerState.isScanning,
-      lastScanAt:           scannerState.lastScanAt,
-      lastM5CandleTime:     scannerState.lastM5CandleTime,
-      lastH1Bias:           scannerState.lastH1Bias,
-      lastM15Result:        scannerState.lastM15Result,
-      lastM5Result:         scannerState.lastM5Result,
+      running:          scannerState.running,
+      isScanning:       scannerState.isScanning,
+      lastScanAt:       scannerState.lastScanAt,
+      lastM5CandleTime: scannerState.lastM5CandleTime,
+      lastH1Bias:       scannerState.lastH1Bias,
+      lastM15Result:    scannerState.lastM15Result,
+      lastM5Result:     scannerState.lastM5Result,
     },
     scannerStats,
     config: {
@@ -965,10 +883,10 @@ app.get("/status", (_req, res) => {
 
 app.get("/test-signal", async (_req, res) => {
   try {
-    const m5 = await checkM5Setup("XAUUSD", "LONG");
+    const m5    = await checkM5Setup("XAUUSD", "LONG");
     const atr   = m5.atr ?? DEFAULT_ATR;
     const entry = m5.entry ?? (await fetchPrice("XAUUSD")) ?? 3300;
-    const slD   = m5.slD ?? findStructureSL([], "LONG", entry) ?? DEFAULT_ATR * SL_MULTIPLIER;
+    const slD   = m5.slD ?? Math.min(Math.max(atr * SL_MULTIPLIER, MIN_SL_DIST), MAX_SL_DIST);
     const levels = buildLevels("LONG", entry, slD);
     const tgResult = await sendTelegram(
       `🧪 <b>TEST SYGNAŁU — XAUUSD LONG</b>\n\n` +
@@ -1011,7 +929,7 @@ app.get("/admin/reset-cooldown", (req, res) => {
   return res.json({ ok: false, message: `Brak cooldownu dla ${ticker}` });
 });
 
-// ── webhook — tryb pasywny (bot działa autonomicznie) ─────────────────────────
+// ── webhook ───────────────────────────────────────────────────────────────────
 app.head("/webhook", (_req, res) => res.sendStatus(200));
 app.get("/webhook",  (_req, res) => res.send("Webhook alive ✅ (bot działa w trybie autonomicznym)"));
 
@@ -1027,6 +945,11 @@ app.post("/webhook", (req, res) => {
   });
 });
 
-// ── st **...**
-
-_This response is too long to display in full._
+// ── start ─────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🤖 Gold Bot nasłuchuje na porcie ${PORT}`);
+  loadTrades();
+  startPriceMonitor();
+  startSignalScanner();
+});
