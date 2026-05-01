@@ -21,9 +21,10 @@ const MAX_ATR        = 25.0;
 const DEFAULT_ATR    = 5.0;
 const RR_MIN         = 1.4;
 const SL_MULTIPLIER  = 1.6;
-const TP1_MULTIPLIER = 1.4;
-const TP2_MULTIPLIER = 2.2;
-const TP3_MULTIPLIER = 3.5;
+const TP1_MULTIPLIER = 1.0;   // 1R  → close 10%, SL → entry
+const TP2_MULTIPLIER = 1.5;   // 1.5R → close 40%, SL → TP1
+const TP3_MULTIPLIER = 2.0;   // 2R  → close 20%, SL → TP2
+const TP4_MULTIPLIER = 3.0;   // 3R  → full close (30%)
 const MIN_SL_DIST    = 8.0;
 const MAX_SL_DIST    = 22.0;
 const COOLDOWN_MS    = 10 * 60 * 1000;
@@ -31,8 +32,11 @@ const COOLDOWN_MS    = 10 * 60 * 1000;
 // ── structure SL config ───────────────────────────────────────────────────────
 const STRUCTURE_SL_LOOKBACK = 15;
 const STRUCTURE_SL_BUFFER   = 1.0;
-// ── trailing stop config ──────────────────────────────────────────────────────
-const TRAIL_ATR_FACTOR      = 0.8;
+// ── partial close config ─────────────────────────────────────────────────────
+const TP1_CLOSE_PCT = 10;
+const TP2_CLOSE_PCT = 40;
+const TP3_CLOSE_PCT = 20;
+const TP4_CLOSE_PCT = 30;
 
 const SESSION_START  = 6;
 const SESSION_END    = 22;
@@ -124,14 +128,8 @@ const scannerStats = {
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-function r(x, d = 2) {
-  return Math.round(Number(x) * 10 ** d) / 10 ** d;
-}
-
-function n(v, fallback = null) {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : fallback;
-}
+function r(x, d = 2) { return Math.round(Number(x) * 10 ** d) / 10 ** d; }
+function n(v, fallback = null) { const x = Number(v); return Number.isFinite(x) ? x : fallback; }
 
 function normalizeSignal(v) {
   if (!v) return null;
@@ -153,10 +151,7 @@ function getWarsawNowParts() {
   const now   = new Date();
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/Warsaw",
-    weekday: "short",
-    hour:    "numeric",
-    minute:  "numeric",
-    hour12:  false,
+    weekday: "short", hour: "numeric", minute: "numeric", hour12: false,
   }).formatToParts(now);
   return {
     weekday: parts.find(p => p.type === "weekday")?.value ?? "",
@@ -182,17 +177,14 @@ function calcEMA(closes, period) {
   if (!Array.isArray(closes) || closes.length < period) return null;
   const k = 2 / (period + 1);
   let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < closes.length; i++) {
-    ema = closes[i] * k + ema * (1 - k);
-  }
+  for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
   return ema;
 }
 
 function calcATR(candles, period = 14) {
   if (!Array.isArray(candles) || candles.length < period + 1) return null;
   const trs = candles.map((c, i, arr) => {
-    const h  = parseFloat(c.high);
-    const lo = parseFloat(c.low);
+    const h = parseFloat(c.high), lo = parseFloat(c.low);
     if (i === 0) return h - lo;
     const pc = parseFloat(arr[i - 1].close);
     return Math.max(h - lo, Math.abs(h - pc), Math.abs(lo - pc));
@@ -327,8 +319,6 @@ async function checkM5Setup(ticker, bias) {
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
   const closes = candles.map(c => parseFloat(c.close));
-  const highs  = candles.map(c => parseFloat(c.high));
-  const lows   = candles.map(c => parseFloat(c.low));
   const last5  = candles.slice(-5);
   const price  = closes[closes.length - 1];
   const ema20  = calcEMA(closes, M5_FAST_EMA);
@@ -398,7 +388,7 @@ async function checkM5Setup(ticker, bias) {
   for (let i = last5.length - 1; i >= 0; i--) {
     const isBull = parseFloat(last5[i].close) > parseFloat(last5[i].open);
     const isBear = parseFloat(last5[i].close) < parseFloat(last5[i].open);
-    if (bias === "LONG"  && isBull) pressureBars++;
+    if (bias === "LONG" && isBull) pressureBars++;
     else if (bias === "SHORT" && isBear) pressureBars++;
     else break;
   }
@@ -440,19 +430,23 @@ function buildLevels(signal, entry, slD) {
   const tp1 = r(entry + dir * slD * TP1_MULTIPLIER);
   const tp2 = r(entry + dir * slD * TP2_MULTIPLIER);
   const tp3 = r(entry + dir * slD * TP3_MULTIPLIER);
+  const tp4 = r(entry + dir * slD * TP4_MULTIPLIER);
   const risk    = Math.abs(entry - sl);
   const reward1 = Math.abs(tp1 - entry);
   const reward2 = Math.abs(tp2 - entry);
   const reward3 = Math.abs(tp3 - entry);
+  const reward4 = Math.abs(tp4 - entry);
   return {
-    entry, sl, tp1, tp2, tp3,
+    entry, sl, tp1, tp2, tp3, tp4,
     rr1:     r(risk > 0 ? reward1 / risk : 0),
     rr2:     r(risk > 0 ? reward2 / risk : 0),
     rr3:     r(risk > 0 ? reward3 / risk : 0),
+    rr4:     r(risk > 0 ? reward4 / risk : 0),
     slDist:  r(slD),
     tp1Dist: r(slD * TP1_MULTIPLIER),
     tp2Dist: r(slD * TP2_MULTIPLIER),
     tp3Dist: r(slD * TP3_MULTIPLIER),
+    tp4Dist: r(slD * TP4_MULTIPLIER),
   };
 }// ── gate checks ───────────────────────────────────────────────────────────────
 function canOpen(ticker, signal, entry, atr, slD) {
@@ -488,11 +482,11 @@ function canOpen(ticker, signal, entry, atr, slD) {
 
   const levels = buildLevels(signal, entry, slD);
   const risk   = Math.abs(entry - levels.sl);
-  const reward = Math.abs(levels.tp1 - entry);
+  const reward = Math.abs(levels.tp2 - entry);
   const realRR = risk > 0 ? r(reward / risk) : 0;
 
   if (realRR < RR_MIN)
-    return { ok: false, reason: `REJECT_RR_TOO_LOW (RR=${realRR} < min ${RR_MIN}, risk=${r(risk)}, reward=${r(reward)})` };
+    return { ok: false, reason: `REJECT_RR_TOO_LOW (RR_TP2=${realRR} < min ${RR_MIN}, risk=${r(risk)}, reward=${r(reward)})` };
 
   return { ok: true, reason: "ACCEPT", levels };
 }
@@ -510,12 +504,12 @@ function registerTrade(ticker, signal, levels, atr) {
     tp1:         levels.tp1,
     tp2:         levels.tp2,
     tp3:         levels.tp3,
+    tp4:         levels.tp4,
     status:      "OPEN",
     openedAt:    new Date().toUTCString(),
     tp1Hit:      false,
     tp2Hit:      false,
-    peakPrice:   levels.entry,
-    tradeAtr:    atr,
+    tp3Hit:      false,
     closedAt:    null,
     closePrice:  null,
     closeReason: null,
@@ -553,9 +547,10 @@ function formatEntry(ticker, signal, levels, atr, tf, strategy) {
     `${emoji} <b>${ticker} ${dir}</b>\n\n` +
     `💰 <b>Entry:</b> <code>${levels.entry}</code>\n` +
     `🛡 <b>SL:</b>    <code>${levels.sl}</code>  <i>(-${levels.slDist} pkt)</i>\n\n` +
-    `🎯 <b>TP1:</b>   <code>${levels.tp1}</code>  <i>(+${levels.tp1Dist} pkt | RR ${levels.rr1})</i>\n` +
-    `🎯🎯 <b>TP2:</b>  <code>${levels.tp2}</code>  <i>(+${levels.tp2Dist} pkt | RR ${levels.rr2})</i>\n` +
-    `🚀 <b>TP3:</b>   <code>${levels.tp3}</code>  <i>(+${levels.tp3Dist} pkt | RR ${levels.rr3})</i>\n\n` +
+    `🎯 <b>TP1:</b>   <code>${levels.tp1}</code>  <i>(+${levels.tp1Dist} pkt | 1R)  → zamknij ${TP1_CLOSE_PCT}%</i>\n` +
+    `🎯🎯 <b>TP2:</b>  <code>${levels.tp2}</code>  <i>(+${levels.tp2Dist} pkt | 1.5R) → zamknij ${TP2_CLOSE_PCT}%</i>\n` +
+    `🚀 <b>TP3:</b>   <code>${levels.tp3}</code>  <i>(+${levels.tp3Dist} pkt | 2R)  → zamknij ${TP3_CLOSE_PCT}%</i>\n` +
+    `🏆 <b>TP4:</b>   <code>${levels.tp4}</code>  <i>(+${levels.tp4Dist} pkt | 3R)  → zamknij ${TP4_CLOSE_PCT}%</i>\n\n` +
     `📊 <b>ATR14:</b> ${r(atr)}  |  <b>TF:</b> ${tf}\n\n` +
     `💼 <b>Kalkulator pozycji</b> <i>(tylko info)</i>\n` +
     `   Balans: $${ACCOUNT_BALANCE}  |  Ryzyko: ${RISK_PERCENT}% ($${r(riskAmount)})\n` +
@@ -584,7 +579,7 @@ async function sendTelegram(text) {
   }
 }
 
-// ── price monitor (TP/SL tracking) ───────────────────────────────────────────
+// ── price monitor ─────────────────────────────────────────────────────────────
 async function checkTrades() {
   for (const [ticker, trade] of activeTrades.entries()) {
     if (trade.status !== "OPEN") continue;
@@ -592,45 +587,24 @@ async function checkTrades() {
     if (price === null) continue;
     const isLong = trade.signal === "LONG";
 
-    // TP1
+    // TP1 — 1R, zamknij 10%, SL → entry
     if (!trade.tp1Hit && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
-      trade.tp1Hit    = true;
-      trade.peakPrice = price;
-      const trailAtr  = trade.tradeAtr ?? DEFAULT_ATR;
-      const initialTrailSL = isLong
-        ? r(Math.max(price - TRAIL_ATR_FACTOR * trailAtr, trade.entry + 1.0))
-        : r(Math.min(price + TRAIL_ATR_FACTOR * trailAtr, trade.entry - 1.0));
-      trade.sl = initialTrailSL;
+      trade.tp1Hit = true;
+      trade.sl     = trade.entry;
       saveTrades();
       const pnl1 = r(Math.abs(trade.tp1 - trade.entry));
       await sendTelegram(
         `🎯 <b>TP1 HIT — ${ticker} #${trade.id}</b>\n` +
         `Wejście: <code>${trade.entry}</code> → TP1: <code>${r(trade.tp1)}</code>\n` +
-        `Cena: <code>${r(price)}</code>  |  +${pnl1} pkt\n\n` +
-        `🔒 <b>Trailing SL aktywny: <code>${initialTrailSL}</code></b>\n` +
-        `🎯🎯 Cel TP2: <code>${r(trade.tp2)}</code>\n` +
+        `Cena: <code>${r(price)}</code>  |  +${pnl1} pkt (1R)\n\n` +
+        `💼 <b>ZAMKNIJ ${TP1_CLOSE_PCT}% pozycji</b>\n` +
+        `🔒 <b>SL → entry (breakeven): <code>${trade.entry}</code></b>\n` +
+        `🎯🎯 Następny cel TP2: <code>${r(trade.tp2)}</code>\n` +
         `<i>${new Date().toUTCString()}</i>`
       );
     }
 
-    // Trailing update
-    if (trade.tp1Hit && !trade.tp2Hit) {
-      const trailAtr  = trade.tradeAtr ?? DEFAULT_ATR;
-      const isNewPeak = isLong ? price > trade.peakPrice : price < trade.peakPrice;
-      if (isNewPeak) {
-        trade.peakPrice = price;
-        const newTrailSL = isLong
-          ? r(price - TRAIL_ATR_FACTOR * trailAtr)
-          : r(price + TRAIL_ATR_FACTOR * trailAtr);
-        if ((isLong && newTrailSL > trade.sl) || (!isLong && newTrailSL < trade.sl)) {
-          trade.sl = newTrailSL;
-          saveTrades();
-          console.log(`[TRAIL] ${ticker} #${trade.id} SL → ${trade.sl} (peak=${r(price)} ATR=${trailAtr})`);
-        }
-      }
-    }
-
-    // TP2
+    // TP2 — 1.5R, zamknij 40%, SL → TP1
     if (!trade.tp2Hit && (isLong ? price >= trade.tp2 : price <= trade.tp2)) {
       trade.tp1Hit = true;
       trade.tp2Hit = true;
@@ -640,23 +614,44 @@ async function checkTrades() {
       await sendTelegram(
         `🎯🎯 <b>TP2 HIT — ${ticker} #${trade.id}</b>\n` +
         `Wejście: <code>${trade.entry}</code> → TP2: <code>${r(trade.tp2)}</code>\n` +
-        `Cena: <code>${r(price)}</code>  |  +${pnl2} pkt\n\n` +
-        `🔒 <b>SL → TP1 (profit locked): <code>${r(trade.tp1)}</code></b>\n` +
-        `🚀 Cel TP3: <code>${r(trade.tp3)}</code>\n` +
+        `Cena: <code>${r(price)}</code>  |  +${pnl2} pkt (1.5R)\n\n` +
+        `💼 <b>ZAMKNIJ ${TP2_CLOSE_PCT}% pozycji</b>\n` +
+        `🔒 <b>SL → TP1: <code>${r(trade.tp1)}</code></b>\n` +
+        `🚀 Następny cel TP3: <code>${r(trade.tp3)}</code>\n` +
         `<i>${new Date().toUTCString()}</i>`
       );
     }
 
-    // TP3
-    if (isLong ? price >= trade.tp3 : price <= trade.tp3) {
+    // TP3 — 2R, zamknij 20%, SL → TP2
+    if (!trade.tp3Hit && (isLong ? price >= trade.tp3 : price <= trade.tp3)) {
+      trade.tp1Hit = true;
+      trade.tp2Hit = true;
+      trade.tp3Hit = true;
+      trade.sl     = trade.tp2;
+      saveTrades();
       const pnl3 = r(Math.abs(trade.tp3 - trade.entry));
-      closeTrade(ticker, price, "TP3");
+      await sendTelegram(
+        `🚀 <b>TP3 HIT — ${ticker} #${trade.id}</b>\n` +
+        `Wejście: <code>${trade.entry}</code> → TP3: <code>${r(trade.tp3)}</code>\n` +
+        `Cena: <code>${r(price)}</code>  |  +${pnl3} pkt (2R)\n\n` +
+        `💼 <b>ZAMKNIJ ${TP3_CLOSE_PCT}% pozycji</b>\n` +
+        `🔒 <b>SL → TP2: <code>${r(trade.tp2)}</code></b>\n` +
+        `🏆 Ostatni cel TP4: <code>${r(trade.tp4)}</code>\n` +
+        `<i>${new Date().toUTCString()}</i>`
+      );
+    }
+
+    // TP4 — 3R, pełne zamknięcie
+    if (isLong ? price >= trade.tp4 : price <= trade.tp4) {
+      const pnl4 = r(Math.abs(trade.tp4 - trade.entry));
+      closeTrade(ticker, price, "TP4");
       lastSignalAt.set(ticker, Date.now());
       await sendTelegram(
-        `🚀 <b>TP3 HIT — PEŁNE ZAMKNIĘCIE — ${ticker} #${trade.id}</b>\n` +
+        `🏆 <b>TP4 HIT — PEŁNE ZAMKNIĘCIE — ${ticker} #${trade.id}</b>\n` +
         `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
-        `TP3: <code>${r(trade.tp3)}</code>  |  Cena: <code>${r(price)}</code>\n` +
-        `💵 <b>P&L: +${pnl3} pkt</b>\n` +
+        `TP4: <code>${r(trade.tp4)}</code>  |  Cena: <code>${r(price)}</code>\n` +
+        `💼 <b>ZAMKNIJ pozostałe ${TP4_CLOSE_PCT}% pozycji</b>\n` +
+        `💵 <b>P&L runner: +${pnl4} pkt (3R)</b>\n` +
         `Otwarto: ${trade.openedAt}\nZamknięto: ${new Date().toUTCString()}`
       );
       continue;
@@ -664,12 +659,13 @@ async function checkTrades() {
 
     // SL
     if (isLong ? price <= trade.sl : price >= trade.sl) {
-      const slLabel            = trade.tp2Hit ? "TP1 (profit locked)"
-                               : trade.tp1Hit ? "trailing SL"
-                               : "struktura SL";
+      const slLabel = trade.tp3Hit ? "TP2 (profit locked)"
+                    : trade.tp2Hit ? "TP1 (profit locked)"
+                    : trade.tp1Hit ? "entry (breakeven)"
+                    : "struktura SL";
       const executedClosePrice = trade.sl;
-      const pnlSl              = r(trade.signal === "LONG" ? executedClosePrice - trade.entry : trade.entry - executedClosePrice);
-      const pnlStr             = pnlSl >= 0 ? `+${pnlSl}` : `${pnlSl}`;
+      const pnlSl  = r(trade.signal === "LONG" ? executedClosePrice - trade.entry : trade.entry - executedClosePrice);
+      const pnlStr = pnlSl >= 0 ? `+${pnlSl}` : `${pnlSl}`;
       closeTrade(ticker, executedClosePrice, "SL");
       lastSignalAt.set(ticker, Date.now());
       await sendTelegram(
@@ -714,7 +710,7 @@ async function scanXAUUSD() {
   scannerState.lastH1Bias = h1.bias;
   if (h1.bias === "NEUTRAL") {
     scannerStats.h1Neutral++;
-    console.log(`[SCAN] REJECT — H1 NEUTRAL (brak jasnego trendu)`);
+    console.log(`[SCAN] REJECT — H1 NEUTRAL`);
     return;
   }
   const signal = h1.bias;
@@ -769,21 +765,15 @@ function startSignalScanner() {
 
   setInterval(async () => {
     scannerState.lastScanAt = new Date().toISOString();
-    if (scannerState.isScanning) {
-      console.log("[SCAN] previous scan still running — skip");
-      return;
-    }
+    if (scannerState.isScanning) { console.log("[SCAN] previous scan still running — skip"); return; }
     const activeNow = activeTrades.get("XAUUSD");
     if (activeNow?.status === "OPEN") {
-      console.log(`[SCAN] Trade #${activeNow.id} otwarty — pomijam polling świec (oszczędzam API)`);
+      console.log(`[SCAN] Trade #${activeNow.id} otwarty — pomijam polling świec`);
       return;
     }
     try {
       const candles = await fetchCandles("XAUUSD", 3, "5min");
-      if (!candles || candles.length < 2) {
-        console.log("[SCAN] Brak danych świec M5 — pomijam");
-        return;
-      }
+      if (!candles || candles.length < 2) { console.log("[SCAN] Brak danych świec M5 — pomijam"); return; }
       const lastClosed = candles[candles.length - 2];
       const candleTime = lastClosed.datetime;
       if (candleTime === scannerState.lastM5CandleTime) {
@@ -793,11 +783,7 @@ function startSignalScanner() {
       scannerState.lastM5CandleTime = candleTime;
       console.log(`[SCAN] new M5 candle detected — ${candleTime} — uruchamiam scan`);
       scannerState.isScanning = true;
-      try {
-        await scanXAUUSD();
-      } finally {
-        scannerState.isScanning = false;
-      }
+      try { await scanXAUUSD(); } finally { scannerState.isScanning = false; }
     } catch (err) {
       console.error("[SCAN] błąd:", err.message);
       scannerState.isScanning = false;
@@ -838,8 +824,8 @@ app.get("/status", (_req, res) => {
     trades.push({
       id: trade.id, ticker, signal: trade.signal, status: trade.status,
       entry: trade.entry, sl: trade.sl, slOriginal: trade.slOriginal,
-      tp1: trade.tp1, tp2: trade.tp2, tp3: trade.tp3,
-      tp1Hit: trade.tp1Hit, tp2Hit: trade.tp2Hit,
+      tp1: trade.tp1, tp2: trade.tp2, tp3: trade.tp3, tp4: trade.tp4,
+      tp1Hit: trade.tp1Hit, tp2Hit: trade.tp2Hit, tp3Hit: trade.tp3Hit,
       openedAt: trade.openedAt, closedAt: trade.closedAt ?? null,
       closePrice: trade.closePrice ?? null, closeReason: trade.closeReason ?? null,
       pnlPts: trade.pnlPts ?? null,
@@ -893,7 +879,7 @@ app.get("/test-signal", async (_req, res) => {
       formatEntry("XAUUSD", "LONG", levels, atr, "M5", "TEST") +
       `\n\n<i>⚠️ To jest sygnał testowy, nie wchodzić w pozycję!</i>`
     );
-    res.json({ ok: true, telegram: tgResult, entry, atr, levels, m5debug: m5.debug, note: "Test signal sent. H1/M15 filters bypassed." });
+    res.json({ ok: true, telegram: tgResult, entry, atr, levels, m5debug: m5.debug });
   } catch (err) { res.json({ ok: false, error: String(err) }); }
 });
 
@@ -939,9 +925,8 @@ app.post("/webhook", (req, res) => {
   console.log("[WEBHOOK] body:", typeof req.body === "string" ? req.body : JSON.stringify(req.body));
   console.log("[WEBHOOK] parsed:", JSON.stringify({ ticker: parsed.ticker, signal: parsed.signal, strategy: parsed.strategy }));
   return res.status(200).json({
-    ok:       true,
-    accepted: false,
-    reason:   "Bot works in autonomous scan mode now. Webhook payloads are logged but do not trigger trades.",
+    ok: true, accepted: false,
+    reason: "Bot works in autonomous scan mode now. Webhook payloads are logged but do not trigger trades.",
   });
 });
 
