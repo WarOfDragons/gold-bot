@@ -21,31 +21,38 @@ const MAX_ATR        = 25.0;
 const DEFAULT_ATR    = 5.0;
 const RR_MIN         = 1.4;
 const SL_MULTIPLIER  = 1.6;
-const TP1_MULTIPLIER = 1.0;   // 1R  → close 10%, SL → entry
-const TP2_MULTIPLIER = 1.5;   // 1.5R → close 40%, SL → TP1
-const TP3_MULTIPLIER = 2.0;   // 2R  → close 20%, SL → TP2
-const TP4_MULTIPLIER = 3.0;   // 3R  → full close (30%)
+const TP1_MULTIPLIER = 1.0;   // 1R   → close 50%, SL → entry
+const TP2_MULTIPLIER = 1.5;   // 1.5R → close 30%, SL → TP1
+const TP3_MULTIPLIER = 2.5;   // 2.5R → full close (20% remaining)
 const MIN_SL_DIST    = 8.0;
-const MAX_SL_DIST    = 22.0;
+const MAX_SL_DIST    = 26.0;
 const COOLDOWN_MS    = 10 * 60 * 1000;
 
 // ── structure SL config ───────────────────────────────────────────────────────
-const STRUCTURE_SL_LOOKBACK = 15;
+const STRUCTURE_SL_LOOKBACK = 24;
 const STRUCTURE_SL_BUFFER   = 1.0;
-// ── partial close config ─────────────────────────────────────────────────────
-const TP1_CLOSE_PCT = 10;
-const TP2_CLOSE_PCT = 40;
-const TP3_CLOSE_PCT = 20;
-const TP4_CLOSE_PCT = 30;
 
-const SESSION_START  = 6;
-const SESSION_END    = 22;
-const FRIDAY_END     = 20;
+// ── partial close config ─────────────────────────────────────────────────────
+const TP1_CLOSE_PCT = 50;
+const TP2_CLOSE_PCT = 30;
+const TP3_CLOSE_PCT = 20;
+
+// ── costs model (info only) ──────────────────────────────────────────────────
+const SPREAD_POINTS    = 0.4;
+const SLIPPAGE_POINTS  = 0.2;
+const ESTIMATED_COST_POINTS = SPREAD_POINTS + SLIPPAGE_POINTS;
+
+const SESSION_START = 6;
+const SESSION_END   = 22;
+const FRIDAY_END    = 20;
 
 // ── H1 bias config ────────────────────────────────────────────────────────────
-const H1_FAST_EMA        = 20;
-const H1_SLOW_EMA        = 50;
-const H1_CANDLES_NEEDED  = 120;
+const H1_FAST_EMA           = 20;
+const H1_SLOW_EMA           = 50;
+const H1_CANDLES_NEEDED     = 120;
+const H1_ADX_MIN            = 20;
+const H1_EMA_SPREAD_MIN_ATR = 0.25;
+const H1_SLOPE_LOOKBACK     = 3;
 
 // ── M15 confirmation config ───────────────────────────────────────────────────
 const M15_FAST_EMA       = 20;
@@ -57,15 +64,17 @@ const M5_FAST_EMA                        = 20;
 const M5_SLOW_EMA                        = 50;
 const M5_CANDLES_NEEDED                  = 60;
 const M5_RECLAIM_LOOKBACK                = 5;
-const M5_RECLAIM_MAX_EMA_DISTANCE_ATR    = 0.35;
-const M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR = 1.8;
-const M5_LAST_CANDLE_MIN_BODY_TO_ATR     = 0.12;
+const M5_RECLAIM_MAX_EMA_DISTANCE_ATR    = 0.65;
+const M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR = 1.4;
+const M5_LAST_CANDLE_MIN_BODY_TO_ATR     = 0.18;
 const M5_CHOP_OVERLAP_THRESHOLD          = 0.80;
 const M5_MAX_PRESSURE_BARS               = 4;
+const M5_EXTREME_LOOKBACK                = 30;
+const M5_EXTREME_ATR_BUFFER              = 1.0;
 
+// ── news window ───────────────────────────────────────────────────────────────
 const NEWS_WINDOW_START = 25;
 const NEWS_WINDOW_END   = 35;
-const WEBHOOK_DEDUP_MS  = 10_000;
 
 // ── persistence ───────────────────────────────────────────────────────────────
 const TRADES_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH ?? "/tmp", "bot_state.json");
@@ -102,11 +111,10 @@ function loadTrades() {
 }
 
 // ── state ─────────────────────────────────────────────────────────────────────
-const activeTrades  = new Map();
-const lastSignalAt  = new Map();
-const lastWebhookAt = new Map();
-const tradeStats    = { total: 0, wins: 0, losses: 0, pnlPts: 0 };
-let tradeIdCounter  = 0;
+const activeTrades = new Map();
+const lastSignalAt = new Map();
+const tradeStats   = { total: 0, wins: 0, losses: 0, breakeven: 0, totalR: 0, pnlPts: 0 };
+let tradeIdCounter = 0;
 
 const scannerState = {
   running:          false,
@@ -134,7 +142,7 @@ function n(v, fallback = null) { const x = Number(v); return Number.isFinite(x) 
 function normalizeSignal(v) {
   if (!v) return null;
   const s = String(v).trim().toUpperCase();
-  if (["BUY", "LONG"].includes(s))   return "LONG";
+  if (["BUY",  "LONG"].includes(s))  return "LONG";
   if (["SELL", "SHORT"].includes(s)) return "SHORT";
   return null;
 }
@@ -192,24 +200,85 @@ function calcATR(candles, period = 14) {
   return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
-// ── structure SL ──────────────────────────────────────────────────────────────
-function findStructureSL(candles, bias, entry) {
-  const lookback = Math.min(STRUCTURE_SL_LOOKBACK, candles.length - 2);
-  const slice    = candles.slice(-(lookback + 1), -1);
-  let slD;
-  if (bias === "LONG") {
-    const swingLow = Math.min(...slice.map(c => parseFloat(c.low)));
-    slD = Math.abs(entry - (swingLow - STRUCTURE_SL_BUFFER));
-  } else {
-    const swingHigh = Math.max(...slice.map(c => parseFloat(c.high)));
-    slD = Math.abs((swingHigh + STRUCTURE_SL_BUFFER) - entry);
+// ── ADX ───────────────────────────────────────────────────────────────────────
+// Klasyczny Wilder ADX z high/low/close
+function calcADX(candles, period = 14) {
+  if (!Array.isArray(candles) || candles.length < period * 2 + 1) return null;
+  const h = candles.map(c => parseFloat(c.high));
+  const l = candles.map(c => parseFloat(c.low));
+  const c = candles.map(c => parseFloat(c.close));
+  const len = candles.length;
+
+  const plusDM  = new Array(len).fill(0);
+  const minusDM = new Array(len).fill(0);
+  const tr      = new Array(len).fill(0);
+
+  for (let i = 1; i < len; i++) {
+    const upMove   = h[i] - h[i - 1];
+    const downMove = l[i - 1] - l[i];
+    plusDM[i]  = upMove > downMove && upMove > 0   ? upMove   : 0;
+    minusDM[i] = downMove > upMove && downMove > 0 ? downMove : 0;
+    tr[i] = Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1]));
   }
-  const bounded = r(Math.min(Math.max(slD, MIN_SL_DIST), MAX_SL_DIST));
-  console.log(`[STRUCTURE_SL] bias=${bias} rawSlD=${r(slD)} bounded=${bounded}`);
-  return bounded;
+
+  // Wilder smoothing
+  let smTR = 0, smPlus = 0, smMinus = 0;
+  for (let i = 1; i <= period; i++) {
+    smTR    += tr[i];
+    smPlus  += plusDM[i];
+    smMinus += minusDM[i];
+  }
+
+  const dxArr = [];
+  for (let i = period + 1; i < len; i++) {
+    smTR    = smTR    - smTR    / period + tr[i];
+    smPlus  = smPlus  - smPlus  / period + plusDM[i];
+    smMinus = smMinus - smMinus / period + minusDM[i];
+    if (smTR === 0) { dxArr.push(0); continue; }
+    const plusDI  = 100 * (smPlus  / smTR);
+    const minusDI = 100 * (smMinus / smTR);
+    const sumDI   = plusDI + minusDI;
+    const dx = sumDI === 0 ? 0 : 100 * Math.abs(plusDI - minusDI) / sumDI;
+    dxArr.push(dx);
+  }
+  if (dxArr.length < period) return null;
+
+  // ADX = średnia z pierwszego okna DX, potem Wilder smoothing
+  let adx = dxArr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxArr.length; i++) {
+    adx = (adx * (period - 1) + dxArr[i]) / period;
+  }
+  return adx;
 }
 
-// ── TwelveData helpers ────────────────────────────────────────────────────────
+// ── structure SL ──────────────────────────────────────────────────────────────
+// Operuje na zamkniętych świecach. Zwraca obiekt z ok/slD/rawSlD/reason.
+function findStructureSL(closedCandles, bias, entry) {
+  const lookback = Math.min(STRUCTURE_SL_LOOKBACK, closedCandles.length - 1);
+  const slice    = closedCandles.slice(-lookback);
+  let rawSlD;
+  if (bias === "LONG") {
+    const swingLow = Math.min(...slice.map(c => parseFloat(c.low)));
+    rawSlD = Math.abs(entry - (swingLow - STRUCTURE_SL_BUFFER));
+  } else {
+    const swingHigh = Math.max(...slice.map(c => parseFloat(c.high)));
+    rawSlD = Math.abs((swingHigh + STRUCTURE_SL_BUFFER) - entry);
+  }
+  const rawR = r(rawSlD);
+
+  if (rawSlD > MAX_SL_DIST) {
+    console.log(`[STRUCTURE_SL] bias=${bias} rawSlD=${rawR} > MAX=${MAX_SL_DIST} → REJECT`);
+    return { ok: false, slD: null, rawSlD: rawR, reason: `STRUCTURE_SL_TOO_WIDE (${rawR} > ${MAX_SL_DIST})` };
+  }
+  if (rawSlD < MIN_SL_DIST) {
+    console.log(`[STRUCTURE_SL] bias=${bias} rawSlD=${rawR} < MIN=${MIN_SL_DIST} → MIN_APPLIED`);
+    return { ok: true, slD: MIN_SL_DIST, rawSlD: rawR, reason: "STRUCTURE_SL_MIN_APPLIED" };
+  }
+  console.log(`[STRUCTURE_SL] bias=${bias} slD=${rawR}`);
+  return { ok: true, slD: rawR, rawSlD: rawR, reason: "STRUCTURE_SL_OK" };
+}
+
+// ── TwelveData ────────────────────────────────────────────────────────────────
 function toTwelveSymbol(ticker) {
   if (ticker === "XAUUSD") return "XAU/USD";
   if (ticker === "XAGUSD") return "XAG/USD";
@@ -252,26 +321,59 @@ async function fetchPrice(ticker) {
 // ── H1 bias ───────────────────────────────────────────────────────────────────
 async function getH1Bias(ticker) {
   const candles = await fetchCandles(ticker, H1_CANDLES_NEEDED, "1h");
-  if (!candles || candles.length < H1_SLOW_EMA + 2) {
+  if (!candles || candles.length < H1_SLOW_EMA + H1_SLOPE_LOOKBACK + 2) {
     console.warn(`[H1] Za mało świec H1 (${candles?.length ?? 0})`);
     return { bias: "NEUTRAL", debug: { error: "insufficient_candles" } };
   }
-  const closes    = candles.map(c => parseFloat(c.close));
+
+  // Tylko zamknięte świece — ostatnia z API może być jeszcze formowana
+  const closedCandles = candles.slice(0, -1);
+  if (closedCandles.length < H1_SLOW_EMA + H1_SLOPE_LOOKBACK + 1) {
+    return { bias: "NEUTRAL", debug: { error: "insufficient_closed_candles" } };
+  }
+
+  const closes    = closedCandles.map(c => parseFloat(c.close));
   const price     = closes[closes.length - 1];
-  const ema20     = calcEMA(closes, H1_FAST_EMA);
+  const ema20Now  = calcEMA(closes, H1_FAST_EMA);
   const ema50     = calcEMA(closes, H1_SLOW_EMA);
-  const ema20prev = calcEMA(closes.slice(0, -1), H1_FAST_EMA);
-  if (!ema20 || !ema50 || !ema20prev) {
-    console.warn("[H1] Nie można obliczyć EMA H1");
+  const ema20Past = calcEMA(closes.slice(0, -H1_SLOPE_LOOKBACK), H1_FAST_EMA);
+  const atr       = calcATR(closedCandles);
+  const adx       = calcADX(closedCandles);
+
+  if (!ema20Now || !ema50 || !ema20Past || !atr) {
+    console.warn("[H1] Nie można obliczyć wskaźników H1");
     return { bias: "NEUTRAL", debug: { error: "indicator_error" } };
   }
-  const ema20rising  = ema20 > ema20prev;
-  const ema20falling = ema20 < ema20prev;
+
+  // 1. ADX trend strength
+  if (adx === null || adx < H1_ADX_MIN) {
+    const debug = { price: r(price), ema20: r(ema20Now), ema50: r(ema50), atr: r(atr), adx: adx === null ? null : r(adx), reason: "H1_ADX_TOO_LOW" };
+    console.log(`[H1] bias=NEUTRAL | reason=H1_ADX_TOO_LOW (ADX=${adx === null ? "null" : r(adx)} < ${H1_ADX_MIN})`);
+    return { bias: "NEUTRAL", debug };
+  }
+
+  // 2. EMA spread
+  const spread    = Math.abs(ema20Now - ema50);
+  const spreadAtr = spread / atr;
+  if (spreadAtr < H1_EMA_SPREAD_MIN_ATR) {
+    const debug = { price: r(price), ema20: r(ema20Now), ema50: r(ema50), atr: r(atr), adx: r(adx), spreadAtr: r(spreadAtr), reason: "H1_EMA_SPREAD_TOO_LOW" };
+    console.log(`[H1] bias=NEUTRAL | reason=H1_EMA_SPREAD_TOO_LOW (${r(spreadAtr)}x ATR < ${H1_EMA_SPREAD_MIN_ATR}x)`);
+    return { bias: "NEUTRAL", debug };
+  }
+
+  // 3. Slope (3-bar)
+  const slopeRising  = ema20Now > ema20Past;
+  const slopeFalling = ema20Now < ema20Past;
+
   let bias = "NEUTRAL";
-  if (price > ema20 && ema20 > ema50 && ema20rising)  bias = "LONG";
-  if (price < ema20 && ema20 < ema50 && ema20falling) bias = "SHORT";
-  const debug = { price: r(price), ema20: r(ema20), ema50: r(ema50), ema20prev: r(ema20prev), ema20rising, bias };
-  console.log(`[H1] bias=${bias} | price=${r(price)} EMA20=${r(ema20)} EMA50=${r(ema50)} slope=${ema20rising ? "↑" : ema20falling ? "↓" : "→"}`);
+  if (price > ema20Now && ema20Now > ema50 && slopeRising)  bias = "LONG";
+  if (price < ema20Now && ema20Now < ema50 && slopeFalling) bias = "SHORT";
+
+  const debug = {
+    price: r(price), ema20: r(ema20Now), ema50: r(ema50), ema20Past: r(ema20Past),
+    atr: r(atr), adx: r(adx), spreadAtr: r(spreadAtr), slopeRising, bias,
+  };
+  console.log(`[H1] bias=${bias} | price=${r(price)} EMA20=${r(ema20Now)} EMA50=${r(ema50)} ADX=${r(adx)} spread=${r(spreadAtr)}xATR slope=${slopeRising ? "↑" : slopeFalling ? "↓" : "→"}`);
   return { bias, debug };
 }
 
@@ -283,16 +385,24 @@ async function confirmM15Direction(ticker, bias) {
     console.warn(`[M15] ${reason}`);
     return { pass: false, reason, debug: {} };
   }
-  const closes = candles.map(c => parseFloat(c.close));
+
+  const closedCandles = candles.slice(0, -1);
+  if (closedCandles.length < M15_SLOW_EMA + 1) {
+    return { pass: false, reason: "REJECT_M15_INSUFFICIENT_CLOSED", debug: {} };
+  }
+
+  const closes = closedCandles.map(c => parseFloat(c.close));
   const price  = closes[closes.length - 1];
   const ema20  = calcEMA(closes, M15_FAST_EMA);
   const ema50  = calcEMA(closes, M15_SLOW_EMA);
+
   if (!ema20 || !ema50) {
     const reason = "REJECT_M15_INDICATOR_ERROR";
     console.warn(`[M15] ${reason}`);
     return { pass: false, reason, debug: {} };
   }
-  const debug = { price: r(price), ema20: r(ema20), ema50: r(ema50) };
+
+  const debug   = { price: r(price), ema20: r(ema20), ema50: r(ema50) };
   const rejects = [];
   if (bias === "LONG") {
     if (!(price > ema20)) rejects.push("M15_PRICE_BELOW_EMA20");
@@ -318,30 +428,42 @@ async function checkM5Setup(ticker, bias) {
     console.warn(`[M5] ${reason}`);
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
-  const closes = candles.map(c => parseFloat(c.close));
-  const last5  = candles.slice(-5);
-  const price  = closes[closes.length - 1];
-  const ema20  = calcEMA(closes, M5_FAST_EMA);
-  const ema50  = calcEMA(closes, M5_SLOW_EMA);
-  const atr    = calcATR(candles);
+
+  // Tylko zamknięte świece
+  const closedCandles = candles.slice(0, -1);
+  if (closedCandles.length < M5_SLOW_EMA + M5_RECLAIM_LOOKBACK + 1) {
+    return { pass: false, reason: "REJECT_M5_INSUFFICIENT_CLOSED", atr: null, entry: null, debug: {} };
+  }
+
+  const closes = closedCandles.map(c => parseFloat(c.close));
+  const last5  = closedCandles.slice(-5);
+
+  const price = closes[closes.length - 1];
+  const ema20 = calcEMA(closes, M5_FAST_EMA);
+  const ema50 = calcEMA(closes, M5_SLOW_EMA);
+  const atr   = calcATR(closedCandles);
+
   if (!ema20 || !ema50 || !atr) {
     const reason = "REJECT_M5_INDICATOR_ERROR";
     console.warn(`[M5] ${reason}`);
     return { pass: false, reason, atr: null, entry: null, debug: {} };
   }
+
   const rejects    = [];
-  const lastCandle = candles[candles.length - 1];
+  const lastCandle = closedCandles[closedCandles.length - 1];
   const lastClose  = parseFloat(lastCandle.close);
   const lastOpen   = parseFloat(lastCandle.open);
   const lastBody   = Math.abs(lastClose - lastOpen);
-  const lookbackCandles = candles.slice(-(M5_RECLAIM_LOOKBACK + 1), -1);
+  const lookbackCandles = closedCandles.slice(-(M5_RECLAIM_LOOKBACK + 1), -1);
 
+  // 1. EMA alignment
   if (bias === "LONG") {
     if (!(ema20 > ema50)) rejects.push("M5_EMA20_BELOW_EMA50");
   } else {
     if (!(ema20 < ema50)) rejects.push("M5_EMA20_ABOVE_EMA50");
   }
 
+  // 2. Reclaim
   const maxReclaimDist = M5_RECLAIM_MAX_EMA_DISTANCE_ATR * atr;
   let reclaimFound = false;
   if (bias === "LONG") {
@@ -358,21 +480,25 @@ async function checkM5Setup(ticker, bias) {
       rejects.push(`M5_NO_RECLAIM_SHORT (żaden high w ostatnich ${M5_RECLAIM_LOOKBACK} świecach nie był blisko EMA20 ±${r(maxReclaimDist)} pkt)`);
   }
 
+  // 3. Ostatnia świeca po właściwej stronie EMA20 + kierunek
   if (bias === "LONG") {
-    if (!(lastClose > ema20)) rejects.push(`M5_LAST_CLOSE_BELOW_EMA20 (close=${r(lastClose)} ema20=${r(ema20)})`);
+    if (!(lastClose > ema20))    rejects.push(`M5_LAST_CLOSE_BELOW_EMA20 (close=${r(lastClose)} ema20=${r(ema20)})`);
     if (!(lastClose > lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BULLISH");
   } else {
-    if (!(lastClose < ema20)) rejects.push(`M5_LAST_CLOSE_ABOVE_EMA20 (close=${r(lastClose)} ema20=${r(ema20)})`);
+    if (!(lastClose < ema20))    rejects.push(`M5_LAST_CLOSE_ABOVE_EMA20 (close=${r(lastClose)} ema20=${r(ema20)})`);
     if (!(lastClose < lastOpen)) rejects.push("M5_LAST_CANDLE_NOT_BEARISH");
   }
 
+  // 4. Body
   if (lastBody < M5_LAST_CANDLE_MIN_BODY_TO_ATR * atr)
     rejects.push(`M5_LAST_CANDLE_WEAK_BODY (body=${r(lastBody)} < ${M5_LAST_CANDLE_MIN_BODY_TO_ATR}x ATR=${r(atr)})`);
 
+  // 5. Dystans od EMA20
   const emaDistAtr = Math.abs(lastClose - ema20) / atr;
   if (emaDistAtr > M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR)
     rejects.push(`M5_TOO_FAR_FROM_EMA (${emaDistAtr.toFixed(2)}x ATR > max ${M5_MAX_ENTRY_DISTANCE_FROM_EMA_ATR}x ATR)`);
 
+  // 6. Chop
   let choppyPairs = 0;
   for (let i = 1; i < last5.length; i++) {
     const pH = parseFloat(last5[i-1].high), pL = parseFloat(last5[i-1].low);
@@ -384,35 +510,22 @@ async function checkM5Setup(ticker, bias) {
   if (choppyPairs >= 3)
     rejects.push(`M5_CHOP (${choppyPairs}/4 par nakłada się > ${M5_CHOP_OVERLAP_THRESHOLD * 100}%)`);
 
+  // 7. Overextension
   let pressureBars = 0;
   for (let i = last5.length - 1; i >= 0; i--) {
     const isBull = parseFloat(last5[i].close) > parseFloat(last5[i].open);
     const isBear = parseFloat(last5[i].close) < parseFloat(last5[i].open);
-    if (bias === "LONG" && isBull) pressureBars++;
+    if      (bias === "LONG"  && isBull) pressureBars++;
     else if (bias === "SHORT" && isBear) pressureBars++;
     else break;
   }
   if (pressureBars > M5_MAX_PRESSURE_BARS)
     rejects.push(`M5_OVEREXTENDED (${pressureBars} świec z rzędu > max ${M5_MAX_PRESSURE_BARS})`);
 
-  const debug = {
-    price: r(price), ema20: r(ema20), ema50: r(ema50), atr: r(atr),
-    reclaimFound, reclaimWindowBars: M5_RECLAIM_LOOKBACK, reclaimMaxDist: r(maxReclaimDist),
-    lastClose: r(lastClose), lastOpen: r(lastOpen), lastBody: r(lastBody),
-    emaDistAtr: `${emaDistAtr.toFixed(2)}x`, choppyPairs, pressureBars,
-  };
-
-  if (rejects.length > 0) {
-    const reason = `REJECT_M5_SETUP_FAILED (${rejects.join(" | ")})`;
-    console.log(`[M5] ${reason}`);
-    return { pass: false, reason, atr: r(atr), entry: null, debug };
-  }
-
-  const slD = findStructureSL(candles, bias, r(lastClose));
-  console.log(`[M5] OK — reclaim CONFIRMED | close=${r(lastClose)} EMA20=${r(ema20)} ATR=${r(atr)} dist=${emaDistAtr.toFixed(2)}x structureSLD=${slD}`);
-  return { pass: true, reason: "M5_OK", atr: r(atr), entry: r(lastClose), slD, debug };
-}
-
+  // 8. Nie shortuj przy wsparciu / nie longuj przy oporze
+  const extremeSlice    = closedCandles.slice(-(M5_EXTREME_LOOKBACK + 1), -1);
+  const recentSwingLow  = Math.min(...extremeSlice.map(c => parseFloat(c.low)));
+  
 // ── position sizing ───────────────────────────────────────────────────────────
 function calcLotSize(entry, sl) {
   const riskAmount = ACCOUNT_BALANCE * (RISK_PERCENT / 100);
@@ -430,25 +543,23 @@ function buildLevels(signal, entry, slD) {
   const tp1 = r(entry + dir * slD * TP1_MULTIPLIER);
   const tp2 = r(entry + dir * slD * TP2_MULTIPLIER);
   const tp3 = r(entry + dir * slD * TP3_MULTIPLIER);
-  const tp4 = r(entry + dir * slD * TP4_MULTIPLIER);
   const risk    = Math.abs(entry - sl);
   const reward1 = Math.abs(tp1 - entry);
   const reward2 = Math.abs(tp2 - entry);
   const reward3 = Math.abs(tp3 - entry);
-  const reward4 = Math.abs(tp4 - entry);
   return {
-    entry, sl, tp1, tp2, tp3, tp4,
+    entry, sl, tp1, tp2, tp3,
     rr1:     r(risk > 0 ? reward1 / risk : 0),
     rr2:     r(risk > 0 ? reward2 / risk : 0),
     rr3:     r(risk > 0 ? reward3 / risk : 0),
-    rr4:     r(risk > 0 ? reward4 / risk : 0),
     slDist:  r(slD),
     tp1Dist: r(slD * TP1_MULTIPLIER),
     tp2Dist: r(slD * TP2_MULTIPLIER),
     tp3Dist: r(slD * TP3_MULTIPLIER),
-    tp4Dist: r(slD * TP4_MULTIPLIER),
   };
-}// ── gate checks ───────────────────────────────────────────────────────────────
+}
+
+// ── gate checks ───────────────────────────────────────────────────────────────
 function canOpen(ticker, signal, entry, atr, slD) {
   if (atr < MIN_ATR) return { ok: false, reason: `ATR za niskie (${atr.toFixed(2)} < ${MIN_ATR})` };
   if (atr > MAX_ATR) return { ok: false, reason: `ATR za wysokie (${atr.toFixed(2)} > ${MAX_ATR})` };
@@ -470,7 +581,7 @@ function canOpen(ticker, signal, entry, atr, slD) {
     const { weekday, hour, minute } = getWarsawNowParts();
     return {
       ok: false,
-      reason: `Poza sesją (teraz ${weekday} ${hour}:${String(minute).padStart(2,"0")} Warszawa | ` +
+      reason: `Poza sesją (teraz ${weekday} ${hour}:${String(minute).padStart(2, "0")} Warszawa | ` +
               `sesja Pn–Czw 06:00–22:00, Pt 06:00–${FRIDAY_END}:00)`,
     };
   }
@@ -482,9 +593,8 @@ function canOpen(ticker, signal, entry, atr, slD) {
 
   const levels = buildLevels(signal, entry, slD);
   const risk   = Math.abs(entry - levels.sl);
-  const reward = Math.abs(levels.tp2 - entry);
+  const reward = Math.abs(levels.tp2 - entry);   // RR sprawdzamy do TP2 (1.5R)
   const realRR = risk > 0 ? r(reward / risk) : 0;
-
   if (realRR < RR_MIN)
     return { ok: false, reason: `REJECT_RR_TOO_LOW (RR_TP2=${realRR} < min ${RR_MIN}, risk=${r(risk)}, reward=${r(reward)})` };
 
@@ -495,32 +605,33 @@ function canOpen(ticker, signal, entry, atr, slD) {
 function registerTrade(ticker, signal, levels, atr) {
   tradeIdCounter++;
   activeTrades.set(ticker, {
-    id:          tradeIdCounter,
+    id:           tradeIdCounter,
     ticker,
     signal,
-    entry:       levels.entry,
-    sl:          levels.sl,
-    slOriginal:  levels.sl,
-    tp1:         levels.tp1,
-    tp2:         levels.tp2,
-    tp3:         levels.tp3,
-    tp4:         levels.tp4,
-    status:      "OPEN",
-    openedAt:    new Date().toUTCString(),
-    tp1Hit:      false,
-    tp2Hit:      false,
-    tp3Hit:      false,
-    closedAt:    null,
-    closePrice:  null,
-    closeReason: null,
-    pnlPts:      null,
+    entry:        levels.entry,
+    sl:           levels.sl,
+    slOriginal:   levels.sl,
+    tp1:          levels.tp1,
+    tp2:          levels.tp2,
+    tp3:          levels.tp3,
+    status:       "OPEN",
+    openedAt:     new Date().toUTCString(),
+    tp1Hit:       false,
+    tp2Hit:       false,
+    realizedR:    0,
+    remainingPct: 100,
+    finalR:       null,
+    closedAt:     null,
+    closePrice:   null,
+    closeReason:  null,
+    pnlPts:       null,
   });
   lastSignalAt.set(ticker, Date.now());
   tradeStats.total++;
   saveTrades();
 }
 
-function closeTrade(ticker, closePrice, reason) {
+function closeTrade(ticker, closePrice, reason, finalR) {
   const trade = activeTrades.get(ticker);
   if (!trade) return;
   const pnl = trade.signal === "LONG"
@@ -531,27 +642,32 @@ function closeTrade(ticker, closePrice, reason) {
   trade.closePrice  = r(closePrice);
   trade.closeReason = reason;
   trade.pnlPts      = pnl;
-  if (reason.startsWith("TP")) { tradeStats.wins++; }
-  else if (reason === "SL")    { tradeStats.losses++; }
+  trade.finalR      = r(finalR);
+
+  if (finalR > 0.05)       tradeStats.wins++;
+  else if (finalR < -0.05) tradeStats.losses++;
+  else                     tradeStats.breakeven++;
+
+  tradeStats.totalR = r(tradeStats.totalR + finalR);
   tradeStats.pnlPts = r(tradeStats.pnlPts + pnl);
   saveTrades();
 }
 
 // ── telegram ──────────────────────────────────────────────────────────────────
 function formatEntry(ticker, signal, levels, atr, tf, strategy) {
-  const emoji = signal === "LONG" ? "🟢" : "🔴";
-  const dir   = signal === "LONG" ? "LONG  📈" : "SHORT 📉";
+  const emoji   = signal === "LONG" ? "🟢" : "🔴";
+  const dir     = signal === "LONG" ? "LONG  📈" : "SHORT 📉";
   const { lotSize, riskAmount, slDistance, floored } = calcLotSize(levels.entry, levels.sl);
   const lotNote = floored ? " <i>(min)</i>" : "";
   return (
     `${emoji} <b>${ticker} ${dir}</b>\n\n` +
     `💰 <b>Entry:</b> <code>${levels.entry}</code>\n` +
     `🛡 <b>SL:</b>    <code>${levels.sl}</code>  <i>(-${levels.slDist} pkt)</i>\n\n` +
-    `🎯 <b>TP1:</b>   <code>${levels.tp1}</code>  <i>(+${levels.tp1Dist} pkt | 1R)  → zamknij ${TP1_CLOSE_PCT}%</i>\n` +
+    `🎯 <b>TP1:</b>   <code>${levels.tp1}</code>  <i>(+${levels.tp1Dist} pkt | 1R)   → zamknij ${TP1_CLOSE_PCT}%</i>\n` +
     `🎯🎯 <b>TP2:</b>  <code>${levels.tp2}</code>  <i>(+${levels.tp2Dist} pkt | 1.5R) → zamknij ${TP2_CLOSE_PCT}%</i>\n` +
-    `🚀 <b>TP3:</b>   <code>${levels.tp3}</code>  <i>(+${levels.tp3Dist} pkt | 2R)  → zamknij ${TP3_CLOSE_PCT}%</i>\n` +
-    `🏆 <b>TP4:</b>   <code>${levels.tp4}</code>  <i>(+${levels.tp4Dist} pkt | 3R)  → zamknij ${TP4_CLOSE_PCT}%</i>\n\n` +
-    `📊 <b>ATR14:</b> ${r(atr)}  |  <b>TF:</b> ${tf}\n\n` +
+    `🚀 <b>TP3:</b>   <code>${levels.tp3}</code>  <i>(+${levels.tp3Dist} pkt | 2.5R) → ZAMKNIJ ${TP3_CLOSE_PCT}% (FULL)</i>\n\n` +
+    `📊 <b>ATR14:</b> ${r(atr)}  |  <b>TF:</b> ${tf}\n` +
+    `💱 <b>Costs model:</b> spread ${SPREAD_POINTS} pkt, slippage ${SLIPPAGE_POINTS} pkt (≈${ESTIMATED_COST_POINTS} pkt total)\n\n` +
     `💼 <b>Kalkulator pozycji</b> <i>(tylko info)</i>\n` +
     `   Balans: $${ACCOUNT_BALANCE}  |  Ryzyko: ${RISK_PERCENT}% ($${r(riskAmount)})\n` +
     `   SL dystans: ${slDistance} pkt\n` +
@@ -579,18 +695,22 @@ async function sendTelegram(text) {
   }
 }
 
-// ── price monitor ─────────────────────────────────────────────────────────────
+// ── price monitor (TP/SL tracking) ───────────────────────────────────────────
 async function checkTrades() {
   for (const [ticker, trade] of activeTrades.entries()) {
     if (trade.status !== "OPEN") continue;
+
     const price = await fetchPrice(ticker);
     if (price === null) continue;
+
     const isLong = trade.signal === "LONG";
 
-    // TP1 — 1R, zamknij 10%, SL → entry
+    // TP1 — 1R, zamknij 50%, SL → entry, +0.50R do realizedR
     if (!trade.tp1Hit && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
-      trade.tp1Hit = true;
-      trade.sl     = trade.entry;
+      trade.tp1Hit       = true;
+      trade.sl           = trade.entry;
+      trade.realizedR    = r(trade.realizedR + (TP1_CLOSE_PCT / 100) * TP1_MULTIPLIER);
+      trade.remainingPct = trade.remainingPct - TP1_CLOSE_PCT;
       saveTrades();
       const pnl1 = r(Math.abs(trade.tp1 - trade.entry));
       await sendTelegram(
@@ -599,16 +719,24 @@ async function checkTrades() {
         `Cena: <code>${r(price)}</code>  |  +${pnl1} pkt (1R)\n\n` +
         `💼 <b>ZAMKNIJ ${TP1_CLOSE_PCT}% pozycji</b>\n` +
         `🔒 <b>SL → entry (breakeven): <code>${trade.entry}</code></b>\n` +
+        `📈 Zrealizowane: <b>${trade.realizedR}R</b>  |  Pozostało: ${trade.remainingPct}%\n` +
         `🎯🎯 Następny cel TP2: <code>${r(trade.tp2)}</code>\n` +
         `<i>${new Date().toUTCString()}</i>`
       );
     }
 
-    // TP2 — 1.5R, zamknij 40%, SL → TP1
+    // TP2 — 1.5R, zamknij 30%, SL → TP1, +0.45R do realizedR
     if (!trade.tp2Hit && (isLong ? price >= trade.tp2 : price <= trade.tp2)) {
-      trade.tp1Hit = true;
-      trade.tp2Hit = true;
-      trade.sl     = trade.tp1;
+      // Gap-protection: jeśli TP1 nie zostało wcześniej oznaczone, dolicz TP1
+      if (!trade.tp1Hit) {
+        trade.tp1Hit       = true;
+        trade.realizedR    = r(trade.realizedR + (TP1_CLOSE_PCT / 100) * TP1_MULTIPLIER);
+        trade.remainingPct = trade.remainingPct - TP1_CLOSE_PCT;
+      }
+      trade.tp2Hit       = true;
+      trade.sl           = trade.tp1;
+      trade.realizedR    = r(trade.realizedR + (TP2_CLOSE_PCT / 100) * TP2_MULTIPLIER);
+      trade.remainingPct = trade.remainingPct - TP2_CLOSE_PCT;
       saveTrades();
       const pnl2 = r(Math.abs(trade.tp2 - trade.entry));
       await sendTelegram(
@@ -617,41 +745,37 @@ async function checkTrades() {
         `Cena: <code>${r(price)}</code>  |  +${pnl2} pkt (1.5R)\n\n` +
         `💼 <b>ZAMKNIJ ${TP2_CLOSE_PCT}% pozycji</b>\n` +
         `🔒 <b>SL → TP1: <code>${r(trade.tp1)}</code></b>\n` +
+        `📈 Zrealizowane: <b>${trade.realizedR}R</b>  |  Pozostało: ${trade.remainingPct}%\n` +
         `🚀 Następny cel TP3: <code>${r(trade.tp3)}</code>\n` +
         `<i>${new Date().toUTCString()}</i>`
       );
     }
 
-    // TP3 — 2R, zamknij 20%, SL → TP2
-    if (!trade.tp3Hit && (isLong ? price >= trade.tp3 : price <= trade.tp3)) {
-      trade.tp1Hit = true;
-      trade.tp2Hit = true;
-      trade.tp3Hit = true;
-      trade.sl     = trade.tp2;
-      saveTrades();
+    // TP3 — 2.5R, pełne zamknięcie reszty
+    if (isLong ? price >= trade.tp3 : price <= trade.tp3) {
+      // Doliczanie pominiętych TP w razie gapu
+      if (!trade.tp1Hit) {
+        trade.tp1Hit       = true;
+        trade.realizedR    = r(trade.realizedR + (TP1_CLOSE_PCT / 100) * TP1_MULTIPLIER);
+        trade.remainingPct = trade.remainingPct - TP1_CLOSE_PCT;
+      }
+      if (!trade.tp2Hit) {
+        trade.tp2Hit       = true;
+        trade.realizedR    = r(trade.realizedR + (TP2_CLOSE_PCT / 100) * TP2_MULTIPLIER);
+        trade.remainingPct = trade.remainingPct - TP2_CLOSE_PCT;
+      }
+      const tp3R = (trade.remainingPct / 100) * TP3_MULTIPLIER;
+      const finalR = r(trade.realizedR + tp3R);
       const pnl3 = r(Math.abs(trade.tp3 - trade.entry));
-      await sendTelegram(
-        `🚀 <b>TP3 HIT — ${ticker} #${trade.id}</b>\n` +
-        `Wejście: <code>${trade.entry}</code> → TP3: <code>${r(trade.tp3)}</code>\n` +
-        `Cena: <code>${r(price)}</code>  |  +${pnl3} pkt (2R)\n\n` +
-        `💼 <b>ZAMKNIJ ${TP3_CLOSE_PCT}% pozycji</b>\n` +
-        `🔒 <b>SL → TP2: <code>${r(trade.tp2)}</code></b>\n` +
-        `🏆 Ostatni cel TP4: <code>${r(trade.tp4)}</code>\n` +
-        `<i>${new Date().toUTCString()}</i>`
-      );
-    }
-
-    // TP4 — 3R, pełne zamknięcie
-    if (isLong ? price >= trade.tp4 : price <= trade.tp4) {
-      const pnl4 = r(Math.abs(trade.tp4 - trade.entry));
-      closeTrade(ticker, price, "TP4");
+      closeTrade(ticker, price, "TP3", finalR);
       lastSignalAt.set(ticker, Date.now());
       await sendTelegram(
-        `🏆 <b>TP4 HIT — PEŁNE ZAMKNIĘCIE — ${ticker} #${trade.id}</b>\n` +
+        `🚀 <b>TP3 HIT — PEŁNE ZAMKNIĘCIE — ${ticker} #${trade.id}</b>\n` +
         `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
-        `TP4: <code>${r(trade.tp4)}</code>  |  Cena: <code>${r(price)}</code>\n` +
-        `💼 <b>ZAMKNIJ pozostałe ${TP4_CLOSE_PCT}% pozycji</b>\n` +
-        `💵 <b>P&L runner: +${pnl4} pkt (3R)</b>\n` +
+        `TP3: <code>${r(trade.tp3)}</code>  |  Cena: <code>${r(price)}</code>\n` +
+        `💼 <b>ZAMKNIJ pozostałe ${trade.remainingPct}% pozycji</b>\n` +
+        `💵 <b>P&L runner: +${pnl3} pkt (2.5R)</b>\n` +
+        `🏆 <b>Total: ${finalR}R</b>\n` +
         `Otwarto: ${trade.openedAt}\nZamknięto: ${new Date().toUTCString()}`
       );
       continue;
@@ -659,21 +783,35 @@ async function checkTrades() {
 
     // SL
     if (isLong ? price <= trade.sl : price >= trade.sl) {
-      const slLabel = trade.tp3Hit ? "TP2 (profit locked)"
-                    : trade.tp2Hit ? "TP1 (profit locked)"
-                    : trade.tp1Hit ? "entry (breakeven)"
-                    : "struktura SL";
+      const slLabel            = trade.tp2Hit ? "TP1 (profit locked)"
+                               : trade.tp1Hit ? "entry (breakeven)"
+                               : "struktura SL";
       const executedClosePrice = trade.sl;
+
+      // Liczymy finalR według scenariusza:
+      let finalR;
+      if (trade.tp2Hit) {
+        // SL po TP2 (na TP1) — runner wraca do TP1, dolicz remainingPct × 1.0R
+        finalR = r(trade.realizedR + (trade.remainingPct / 100) * TP1_MULTIPLIER);
+      } else if (trade.tp1Hit) {
+        // SL po TP1 (na entry) — runner wraca do 0R, finalR = realizedR
+        finalR = r(trade.realizedR);
+      } else {
+        // SL przed TP1 — pełna strata
+        finalR = -1;
+      }
+
       const pnlSl  = r(trade.signal === "LONG" ? executedClosePrice - trade.entry : trade.entry - executedClosePrice);
       const pnlStr = pnlSl >= 0 ? `+${pnlSl}` : `${pnlSl}`;
-      closeTrade(ticker, executedClosePrice, "SL");
+      closeTrade(ticker, executedClosePrice, "SL", finalR);
       lastSignalAt.set(ticker, Date.now());
       await sendTelegram(
         `🛑 <b>SL HIT — ${ticker} #${trade.id}</b>\n` +
         `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
         `SL (<i>${slLabel}</i>): <code>${r(executedClosePrice)}</code>\n` +
         `Cena rynkowa w chwili wykrycia: <code>${r(price)}</code>\n` +
-        `💵 <b>P&L: ${pnlStr} pkt</b>\n` +
+        `💵 <b>P&L runner: ${pnlStr} pkt</b>\n` +
+        `🏆 <b>Total: ${finalR}R</b>\n` +
         `Otwarto: ${trade.openedAt}\nZamknięto: ${new Date().toUTCString()}`
       );
     }
@@ -682,7 +820,7 @@ async function checkTrades() {
 
 function startPriceMonitor() {
   if (!TWELVEDATA_KEY) { console.warn("[MONITOR] TWELVEDATA_API_KEY nie ustawiony — wyłączony"); return; }
-  console.log("[MONITOR] Price monitor uruchomiony (2min open trade / 10min idle)");
+  console.log("[MONITOR] Price monitor uruchomiony (co 30s gdy trade otwarty, co 10min gdy idle)");
   let lastIdleCheck = 0;
   setInterval(async () => {
     const hasOpen = [...activeTrades.values()].some(t => t.status === "OPEN");
@@ -693,10 +831,10 @@ function startPriceMonitor() {
       lastIdleCheck = now;
       await checkTrades().catch(console.error);
     }
-  }, 2 * 60_000);
+  }, 30_000);
 }
 
-// ── autonomous scan ───────────────────────────────────────────────────────────
+// ── autonomous scanner ────────────────────────────────────────────────────────
 async function scanXAUUSD() {
   const ticker = "XAUUSD";
   const active = activeTrades.get(ticker);
@@ -754,7 +892,6 @@ async function scanXAUUSD() {
   console.log(`[ENTRY] #${activeTrades.get(ticker).id} ${signal} ${ticker} @ ${entry} ATR=${r(atr)} H1=${h1.bias} [AUTONOMOUS]`);
 }
 
-// ── signal scanner ────────────────────────────────────────────────────────────
 function startSignalScanner() {
   if (!TWELVEDATA_KEY) {
     console.warn("[SCAN] TWELVEDATA_API_KEY nie ustawiony — scanner wyłączony");
@@ -766,24 +903,31 @@ function startSignalScanner() {
   setInterval(async () => {
     scannerState.lastScanAt = new Date().toISOString();
     if (scannerState.isScanning) { console.log("[SCAN] previous scan still running — skip"); return; }
+
     const activeNow = activeTrades.get("XAUUSD");
     if (activeNow?.status === "OPEN") {
       console.log(`[SCAN] Trade #${activeNow.id} otwarty — pomijam polling świec`);
       return;
     }
+
     try {
       const candles = await fetchCandles("XAUUSD", 3, "5min");
       if (!candles || candles.length < 2) { console.log("[SCAN] Brak danych świec M5 — pomijam"); return; }
+
       const lastClosed = candles[candles.length - 2];
       const candleTime = lastClosed.datetime;
+
       if (candleTime === scannerState.lastM5CandleTime) {
         console.log(`[SCAN] no new M5 candle (last: ${candleTime})`);
         return;
       }
+
       scannerState.lastM5CandleTime = candleTime;
       console.log(`[SCAN] new M5 candle detected — ${candleTime} — uruchamiam scan`);
+
       scannerState.isScanning = true;
       try { await scanXAUUSD(); } finally { scannerState.isScanning = false; }
+
     } catch (err) {
       console.error("[SCAN] błąd:", err.message);
       scannerState.isScanning = false;
@@ -824,8 +968,9 @@ app.get("/status", (_req, res) => {
     trades.push({
       id: trade.id, ticker, signal: trade.signal, status: trade.status,
       entry: trade.entry, sl: trade.sl, slOriginal: trade.slOriginal,
-      tp1: trade.tp1, tp2: trade.tp2, tp3: trade.tp3, tp4: trade.tp4,
-      tp1Hit: trade.tp1Hit, tp2Hit: trade.tp2Hit, tp3Hit: trade.tp3Hit,
+      tp1: trade.tp1, tp2: trade.tp2, tp3: trade.tp3,
+      tp1Hit: trade.tp1Hit, tp2Hit: trade.tp2Hit,
+      realizedR: trade.realizedR, remainingPct: trade.remainingPct, finalR: trade.finalR,
       openedAt: trade.openedAt, closedAt: trade.closedAt ?? null,
       closePrice: trade.closePrice ?? null, closeReason: trade.closeReason ?? null,
       pnlPts: trade.pnlPts ?? null,
@@ -863,16 +1008,21 @@ app.get("/status", (_req, res) => {
       rrMin:          RR_MIN,
       cooldownMin:    COOLDOWN_MS / 60000,
       session:        `Pn–Czw ${SESSION_START}:00–${SESSION_END}:00, Pt ${SESSION_START}:00–${FRIDAY_END}:00 (Warszawa)`,
+      tpMultipliers:  { tp1: TP1_MULTIPLIER, tp2: TP2_MULTIPLIER, tp3: TP3_MULTIPLIER },
+      partialClose:   { tp1: TP1_CLOSE_PCT, tp2: TP2_CLOSE_PCT, tp3: TP3_CLOSE_PCT },
+      h1Filters:      { adxMin: H1_ADX_MIN, emaSpreadMinAtr: H1_EMA_SPREAD_MIN_ATR, slopeLookback: H1_SLOPE_LOOKBACK },
+      structureSL:    { lookback: STRUCTURE_SL_LOOKBACK, minDist: MIN_SL_DIST, maxDist: MAX_SL_DIST },
+      costsModel:     { spreadPoints: SPREAD_POINTS, slippagePoints: SLIPPAGE_POINTS, estimatedTotal: ESTIMATED_COST_POINTS },
     },
   });
 });
 
 app.get("/test-signal", async (_req, res) => {
   try {
-    const m5    = await checkM5Setup("XAUUSD", "LONG");
-    const atr   = m5.atr ?? DEFAULT_ATR;
-    const entry = m5.entry ?? (await fetchPrice("XAUUSD")) ?? 3300;
-    const slD   = m5.slD ?? Math.min(Math.max(atr * SL_MULTIPLIER, MIN_SL_DIST), MAX_SL_DIST);
+    const m5     = await checkM5Setup("XAUUSD", "LONG");
+    const atr    = m5.atr ?? DEFAULT_ATR;
+    const entry  = m5.entry ?? (await fetchPrice("XAUUSD")) ?? 3300;
+    const slD    = m5.slD ?? Math.min(Math.max(atr * SL_MULTIPLIER, MIN_SL_DIST), MAX_SL_DIST);
     const levels = buildLevels("LONG", entry, slD);
     const tgResult = await sendTelegram(
       `🧪 <b>TEST SYGNAŁU — XAUUSD LONG</b>\n\n` +
@@ -889,8 +1039,14 @@ app.get("/admin/close", async (req, res) => {
   const trade  = activeTrades.get(ticker);
   if (!trade || trade.status !== "OPEN")
     return res.json({ ok: false, reason: `Brak otwartego trade dla ${ticker}` });
-  const price = await fetchPrice(ticker) ?? trade.entry;
-  closeTrade(ticker, price, reason);
+  const price  = await fetchPrice(ticker) ?? trade.entry;
+  // Manual close — finalR = realizedR + remainingPct na bieżącej cenie w R
+  const isLong   = trade.signal === "LONG";
+  const slD      = Math.abs(trade.entry - trade.slOriginal);
+  const movePts  = isLong ? (price - trade.entry) : (trade.entry - price);
+  const moveR    = slD > 0 ? movePts / slD : 0;
+  const finalR   = r(trade.realizedR + (trade.remainingPct / 100) * moveR);
+  closeTrade(ticker, price, reason, finalR);
   lastSignalAt.set(ticker, Date.now());
   const pnl    = trade.pnlPts;
   const pnlStr = pnl >= 0 ? `+${pnl}` : `${pnl}`;
@@ -898,11 +1054,12 @@ app.get("/admin/close", async (req, res) => {
     `🔧 <b>RĘCZNE ZAMKNIĘCIE — ${ticker} #${trade.id}</b>\n` +
     `Pozycja: ${trade.signal} @ <code>${trade.entry}</code>\n` +
     `Zamknięto @ <code>${r(price)}</code>  (<i>${reason}</i>)\n` +
-    `💵 <b>P&L: <code>${pnlStr} pkt</code></b>\n` +
+    `💵 <b>P&L runner: <code>${pnlStr} pkt</code></b>\n` +
+    `🏆 <b>Total: ${finalR}R</b>\n` +
     `<i>${new Date().toUTCString()}</i>`
   );
-  console.log(`[ADMIN] Ręcznie zamknięto ${ticker} @ ${r(price)} (${reason}), P&L: ${pnlStr} pkt`);
-  return res.json({ ok: true, ticker, closePrice: r(price), pnlPts: pnl, reason });
+  console.log(`[ADMIN] Ręcznie zamknięto ${ticker} @ ${r(price)} (${reason}), finalR=${finalR}, P&L: ${pnlStr} pkt`);
+  return res.json({ ok: true, ticker, closePrice: r(price), pnlPts: pnl, finalR, reason });
 });
 
 app.get("/admin/reset-cooldown", (req, res) => {
@@ -915,7 +1072,7 @@ app.get("/admin/reset-cooldown", (req, res) => {
   return res.json({ ok: false, message: `Brak cooldownu dla ${ticker}` });
 });
 
-// ── webhook ───────────────────────────────────────────────────────────────────
+// ── webhook — tryb pasywny ────────────────────────────────────────────────────
 app.head("/webhook", (_req, res) => res.sendStatus(200));
 app.get("/webhook",  (_req, res) => res.send("Webhook alive ✅ (bot działa w trybie autonomicznym)"));
 
@@ -926,7 +1083,7 @@ app.post("/webhook", (req, res) => {
   console.log("[WEBHOOK] parsed:", JSON.stringify({ ticker: parsed.ticker, signal: parsed.signal, strategy: parsed.strategy }));
   return res.status(200).json({
     ok: true, accepted: false,
-    reason: "Bot works in autonomous scan mode now. Webhook payloads are logged but do not trigger trades.",
+    reason: "Bot works in autonomous scan mode. Webhook payloads are logged but do not trigger trades.",
   });
 });
 
