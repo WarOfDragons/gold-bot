@@ -525,7 +525,40 @@ async function checkM5Setup(ticker, bias) {
   // 8. Nie shortuj przy wsparciu / nie longuj przy oporze
   const extremeSlice    = closedCandles.slice(-(M5_EXTREME_LOOKBACK + 1), -1);
   const recentSwingLow  = Math.min(...extremeSlice.map(c => parseFloat(c.low)));
-  
+  const recentSwingHigh = Math.max(...extremeSlice.map(c => parseFloat(c.high)));
+  const distToLow       = lastClose - recentSwingLow;
+  const distToHigh      = recentSwingHigh - lastClose;
+  if (bias === "SHORT" && distToLow  < M5_EXTREME_ATR_BUFFER * atr)
+    rejects.push(`M5_SHORT_AT_SUPPORT (cena=${r(lastClose)} blisko swing low ${r(recentSwingLow)}, dystans=${r(distToLow)} < ${M5_EXTREME_ATR_BUFFER}×ATR=${r(atr)})`);
+  if (bias === "LONG"  && distToHigh < M5_EXTREME_ATR_BUFFER * atr)
+    rejects.push(`M5_LONG_AT_RESISTANCE (cena=${r(lastClose)} blisko swing high ${r(recentSwingHigh)}, dystans=${r(distToHigh)} < ${M5_EXTREME_ATR_BUFFER}×ATR=${r(atr)})`);
+
+  const debug = {
+    price: r(price), ema20: r(ema20), ema50: r(ema50), atr: r(atr),
+    reclaimFound, reclaimWindowBars: M5_RECLAIM_LOOKBACK, reclaimMaxDist: r(maxReclaimDist),
+    lastClose: r(lastClose), lastOpen: r(lastOpen), lastBody: r(lastBody),
+    emaDistAtr: `${emaDistAtr.toFixed(2)}x`, choppyPairs, pressureBars,
+    recentSwingLow: r(recentSwingLow), recentSwingHigh: r(recentSwingHigh),
+    distToLow: r(distToLow), distToHigh: r(distToHigh),
+  };
+
+  if (rejects.length > 0) {
+    const reason = `REJECT_M5_SETUP_FAILED (${rejects.join(" | ")})`;
+    console.log(`[M5] ${reason}`);
+    return { pass: false, reason, atr: r(atr), entry: null, debug };
+  }
+
+  // Structure SL — może odrzucić setup
+  const structure = findStructureSL(closedCandles, bias, r(lastClose));
+  if (!structure.ok) {
+    console.log(`[M5] REJECT — ${structure.reason}`);
+    return { pass: false, reason: `REJECT_M5_${structure.reason}`, atr: r(atr), entry: null, debug: { ...debug, structure } };
+  }
+
+  console.log(`[M5] OK — reclaim CONFIRMED | close=${r(lastClose)} EMA20=${r(ema20)} ATR=${r(atr)} dist=${emaDistAtr.toFixed(2)}x slD=${structure.slD} (raw=${structure.rawSlD}) ${structure.reason}`);
+  return { pass: true, reason: "M5_OK", atr: r(atr), entry: r(lastClose), slD: structure.slD, structure, debug };
+}
+
 // ── position sizing ───────────────────────────────────────────────────────────
 function calcLotSize(entry, sl) {
   const riskAmount = ACCOUNT_BALANCE * (RISK_PERCENT / 100);
